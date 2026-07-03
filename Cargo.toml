@@ -1,0 +1,19 @@
+[package]
+name = "moonblokz-vote"
+version = "0.1.0"
+edition = "2024"
+description = "MoonBlokz no_std vote engine — reversible per-node accumulated-vote registry."
+license = "MIT"
+repository = "https://github.com/petersallai/moonblokz-vote"
+keywords = ["embedded", "no-std", "blockchain", "moonblokz", "vote"]
+categories = ["embedded", "no-std"]
+
+[dependencies]
+moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false, features = ["schnorr-crypto-bigint"] }
+rand_xoshiro = { version = "0.7", default-features = false }
+
+# Test-only: needed to sign `BlockBuilder::build_signed(...)` fixtures.
+# Not linked into production builds — leaf-crate discipline holds on the
+# `[dependencies]` set above.
+[dev-dependencies]
+moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false, features = ["schnorr-crypto-bigint"] }
