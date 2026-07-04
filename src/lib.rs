@@ -41,7 +41,6 @@
 //! header field is `> 0`, the `first_voted_node`'s accumulated vote is also
 //! reset (grace-period penalty per FR47, once per fallback cycle).
 
-use core::cell::Cell;
 use core::cmp::Ordering;
 use core::num::NonZeroU16;
 use moonblokz_chain_types::BlockView;
@@ -64,13 +63,6 @@ pub enum VoteEngineError {
 /// - `MAX_NODES`: workspace node-roster capacity (architecture §5 default: 1000).
 pub struct VoteEngine<const MAX_NODES: usize> {
     accumulated_vote: [u32; MAX_NODES],
-    // `Cell` gives compute-on-demand caching under an `&self` query surface
-    // (architecture §3.4 signature). `no_std`-safe, single-threaded, zero
-    // runtime overhead. Invalidated on every write path (`apply_block`,
-    // `undo_block`, `seed_from_balance_block`). Outer `Option` is cache
-    // validity (`None` = invalidated); inner `Option` is the FR38 result,
-    // so an empty roster (no eligible creator) is cacheable too.
-    cached_top_creator: Cell<Option<Option<u32>>>,
     vote_scale: NonZeroU16,
     vote_interest: u8,
     // Smallest `av` for which `floor(av * vote_interest / vote_scale) >= vote_scale`.
@@ -95,7 +87,6 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         let cap_threshold = Self::compute_cap_threshold(vote_scale, vote_interest);
         Self {
             accumulated_vote: [0u32; MAX_NODES],
-            cached_top_creator: Cell::new(None),
             vote_scale,
             vote_interest,
             cap_threshold,
@@ -282,8 +273,6 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
             }
         }
 
-        // Invalidate the top-creator cache; Story 3.3 recomputes on demand.
-        self.cached_top_creator.set(None);
         Ok(())
     }
 
@@ -307,9 +296,6 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// [`apply_block`](Self::apply_block)), so an error leaves the
     /// accumulated-vote state unchanged.
     pub fn undo_block(&mut self, block: BlockView<'_>) -> Result<(), VoteEngineError> {
-        // Invalidate the cache first for safety (mirrors apply_block discipline).
-        self.cached_top_creator.set(None);
-
         let creator_idx = block.creator() as usize;
         // Ordinary blocks carry `consumed_votes_from_first_voted_node == 0`; only
         // deviation blocks record the penalized node's pre-penalty snapshot.
@@ -398,7 +384,6 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
             }
             self.accumulated_vote[owner] = entry.vote_count();
         }
-        self.cached_top_creator.set(None);
     }
 
     /// Returns the accumulated vote for `node_id`. Returns `0` for
@@ -420,22 +405,26 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// start. Returns `None` only in the degenerate `MAX_NODES == 0`
     /// configuration.
     ///
-    /// Compute-on-demand with cache: the first call after a write (apply /
-    /// undo / seed) recomputes and caches the result in `cached_top_creator`;
-    /// subsequent calls short-circuit through the cache until the next write
-    /// invalidates it.
+    /// Pure `&self` scan, O(MAX_NODES), uncached: iterate node ids in
+    /// ascending order and keep the best under the (vote_desc, node_id_asc)
+    /// order — replace only on a **strictly greater** vote so ties naturally
+    /// break to the lower id.
     ///
     /// Deadline and grace-period progression are deliberately **not** this
     /// crate's concern: the blockchain module (Epic 8 / FR44–FR47) owns the
     /// deadline registry and, as the grace period expands, walks the same
     /// projection via [`creator_at_rank`](Self::creator_at_rank).
     pub fn top_creator(&self) -> Option<u32> {
-        if let Some(cached) = self.cached_top_creator.get() {
-            return cached;
+        let mut top: Option<(u32, u32)> = None;
+        for node_id in 0..MAX_NODES {
+            let av = self.accumulated_vote[node_id];
+            match top {
+                None => top = Some((node_id as u32, av)),
+                Some((_, top_vote)) if av > top_vote => top = Some((node_id as u32, av)),
+                _ => {}
+            }
         }
-        let computed = self.compute_top_creator();
-        self.cached_top_creator.set(Some(computed));
-        computed
+        top.map(|(node_id, _)| node_id)
     }
 
     /// Returns the `rank`-th creator in the FR38 descending-by-vote order.
@@ -494,22 +483,14 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// the ascending-id tail of the order), so at bootstrap the lowest node
     /// ids fill the band.
     ///
-    /// `rank == 1` asks "is this the top creator" and short-circuits to the
-    /// cached [`top_creator`](Self::top_creator) — O(1) on a cache hit, and
-    /// a miss fills the cache. Larger bands run a single O(MAX_NODES) scan
-    /// with early exit: `node_id` is in the band iff fewer than `rank` nodes
-    /// precede it in the (vote descending, node-id ascending) order.
-    /// Intended as the frequent Epic 8 / FR44 admitted-set membership check.
+    /// Single O(MAX_NODES) scan with early exit: `node_id` is in the band iff
+    /// fewer than `rank` nodes precede it in the (vote descending, node-id
+    /// ascending) order. Intended as the frequent Epic 8 / FR44 admitted-set
+    /// membership check.
     pub fn is_creator_within_rank(&self, rank: usize, node_id: u32) -> bool {
         let idx = node_id as usize;
         if rank == 0 || idx >= MAX_NODES {
             return false;
-        }
-        // The band of size 1 is exactly the top creator — serve it from the
-        // cached top_creator() path (O(1) on a cache hit; a miss fills the
-        // cache for the frequent per-block queries).
-        if rank == 1 {
-            return self.top_creator() == Some(node_id);
         }
         let own_vote = self.accumulated_vote[idx];
         // Count nodes strictly ahead of `node_id` in the
@@ -530,34 +511,13 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         true
     }
 
-    /// Linear-scan implementation of FR38 top-creator selection. Called by
-    /// `top_creator` on a cache miss.
-    fn compute_top_creator(&self) -> Option<u32> {
-        // Iterate node ids in ascending order so ties are naturally broken by
-        // the lower id — we only replace `top` on **strictly greater** votes.
-        let mut top: Option<(u32, u32)> = None;
-        for node_id in 0..MAX_NODES {
-            let av = self.accumulated_vote[node_id];
-            match top {
-                None => top = Some((node_id as u32, av)),
-                Some((_, top_vote)) if av > top_vote => top = Some((node_id as u32, av)),
-                _ => {}
-            }
-        }
-        top.map(|(node_id, _)| node_id)
-    }
-
     /// Test-only helper: directly set a node's accumulated vote. Not part
-    /// of the runtime API. Story 3.2's `seed_from_balance_block` will
-    /// provide the runtime seeding path.
+    /// of the runtime API; `seed_from_balance_block` is the runtime seeding path.
     #[cfg(test)]
     pub(crate) fn set_accumulated_vote_for_test(&mut self, node_id: u32, value: u32) {
         let idx = node_id as usize;
         if idx < MAX_NODES {
             self.accumulated_vote[idx] = value;
-            // Mirror the runtime write paths: any vote mutation invalidates
-            // the top-creator cache.
-            self.cached_top_creator.set(None);
         }
     }
 }
@@ -896,22 +856,6 @@ mod tests {
         let a = run();
         let b = run();
         assert_eq!(a, b, "identical op sequence must yield identical state");
-    }
-
-    #[test]
-    fn apply_block_invalidates_cached_top_creator() {
-        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
-        // Directly poison the cache so we can observe the invalidation.
-        engine.cached_top_creator.set(Some(Some(42)));
-
-        let crypto = test_crypto();
-        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
-        let block = make_empty_block(3, &mut buf, &crypto);
-        engine.apply_block(block).expect("apply block must succeed");
-
-        // apply_block called set(None); all votes are zero, so the
-        // recompute-on-read returns the bootstrap order head: node 0.
-        assert_eq!(engine.top_creator(), Some(0));
     }
 
     #[test]
@@ -1375,23 +1319,10 @@ mod tests {
     }
 
     #[test]
-    fn top_creator_cached_between_reads() {
-        // Two consecutive reads without an invalidating write must return the
-        // same result — the second read is served from the cache.
-        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
-        engine.set_accumulated_vote_for_test(7, 300);
-        let first = engine.top_creator();
-        let second = engine.top_creator();
-        assert_eq!(first, Some(7));
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn top_creator_recomputes_after_apply_block_invalidation() {
+    fn top_creator_tracks_state_after_apply_block() {
         let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(5, 200);
         engine.set_accumulated_vote_for_test(7, 100);
-        // Prime the cache: top_creator = 5.
         assert_eq!(engine.top_creator(), Some(5));
 
         // Apply a block where node 5 is the creator — step 3 resets av[5] to 0.
@@ -1405,11 +1336,10 @@ mod tests {
     }
 
     #[test]
-    fn top_creator_recomputes_after_undo_block_invalidation() {
+    fn top_creator_tracks_state_after_undo_block() {
         let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(3, 2000);
         engine.set_accumulated_vote_for_test(7, 100);
-        // Prime the cache with the state where node 3 is top.
         assert_eq!(engine.top_creator(), Some(3));
 
         // Apply a block where node 3 is creator (resets av[3] to 0). Then
@@ -1434,14 +1364,13 @@ mod tests {
     }
 
     #[test]
-    fn top_creator_recomputes_after_seed_from_balance_block_invalidation() {
+    fn top_creator_tracks_state_after_seed_from_balance_block() {
         let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 100);
-        // Prime the cache: node 2 is top.
         assert_eq!(engine.top_creator(), Some(2));
 
         // Seed a balance block that reseeds node 5 with a much larger vote —
-        // top should recompute to 5 after the invalidation.
+        // top should reflect node 5 afterwards.
         let crypto = test_crypto();
         let pk = [0xBBu8; 32];
         let entries = [NodeInfo::new(5, 0, 9999, &pk)];
@@ -1575,20 +1504,16 @@ mod tests {
     }
 
     #[test]
-    fn is_creator_within_rank_one_uses_cached_top_creator() {
+    fn is_creator_within_rank_one_matches_top_creator_after_writes() {
         let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(5, 300);
         engine.set_accumulated_vote_for_test(7, 200);
 
-        // The rank-1 fast path routes through top_creator() and fills its cache.
-        assert!(engine.cached_top_creator.get().is_none());
+        // rank-1 band membership == "is the top creator".
         assert!(engine.is_creator_within_rank(1, 5));
-        assert_eq!(engine.cached_top_creator.get(), Some(Some(5)));
-
-        // Cache-consistent answer for a non-top id.
         assert!(!engine.is_creator_within_rank(1, 7));
 
-        // A write invalidates the cache; the fast path recomputes the new top.
+        // A write that changes the top flips membership accordingly.
         engine.set_accumulated_vote_for_test(7, 400);
         assert!(engine.is_creator_within_rank(1, 7));
         assert!(!engine.is_creator_within_rank(1, 5));
