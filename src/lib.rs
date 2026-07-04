@@ -6,10 +6,16 @@
 //! that applies FR37 forward accumulation. Story 3.3 adds FR38 next-eligible-
 //! creator selection.
 //!
-//! **Leaf-crate discipline.** Depends only on `moonblokz-chain-types`
-//! (for `BlockView<'_>` / `TransactionView<'_>` / `ComplexTransactionView<'_>`)
-//! and `rand_xoshiro` (Story 3.3 tie-break PRNG). **No** dependency on
-//! `moonblokz-blockchain`, **no** crypto, **no** radio.
+//! **Leaf-crate discipline.** The only direct dependency is
+//! `moonblokz-chain-types` (for `BlockView<'_>` / `TransactionView<'_>` /
+//! `ComplexTransactionView<'_>`). **No** direct dependency on
+//! `moonblokz-blockchain`, crypto, or radio. `moonblokz-chain-types`
+//! mandates one Schnorr backend feature, so `moonblokz-crypto` is present
+//! in the transitive tree.
+//!
+//! The crate is fully deterministic and holds no PRNG: FR38 creator
+//! ordering is deterministic (descending vote, ascending node-id
+//! tie-break), and no planned story consumes vote-side randomness.
 //!
 //! Vote-target scoring is upstream / out of scope per ADR-007. The vote
 //! engine consumes the `vote: u32` field already present on each transaction
@@ -39,8 +45,6 @@ use core::cell::Cell;
 use core::cmp::Ordering;
 use core::num::NonZeroU16;
 use moonblokz_chain_types::BlockView;
-use rand_xoshiro::Xoshiro256PlusPlus;
-use rand_xoshiro::rand_core::SeedableRng;
 
 /// Errors returned when a vote-state transition would violate the reversible
 /// `u32` accumulated-vote contract.
@@ -58,21 +62,15 @@ pub enum VoteEngineError {
 ///
 /// Const generic:
 /// - `MAX_NODES`: workspace node-roster capacity (architecture §5 default: 1000).
-///
-/// The `sub_seed_prng` is stored construction-time from the caller-supplied
-/// `sub_seed` (from `moonblokz-blockchain::Prng::derive_subseed("vote")`).
-/// Story 3.1 seeds it but does not advance it; Story 3.3 will use it for
-/// FR38 deterministic tie-breaks.
 pub struct VoteEngine<const MAX_NODES: usize> {
     accumulated_vote: [u32; MAX_NODES],
     // `Cell` gives compute-on-demand caching under an `&self` query surface
     // (architecture §3.4 signature). `no_std`-safe, single-threaded, zero
     // runtime overhead. Invalidated on every write path (`apply_block`,
-    // `undo_block`, `seed_from_balance_block`).
-    cached_top_creator: Cell<Option<u32>>,
-    #[allow(dead_code)]
-    // reserved for later stories (grace-period tie-break, ADR-015 subgroup selection)
-    sub_seed_prng: Xoshiro256PlusPlus,
+    // `undo_block`, `seed_from_balance_block`). Outer `Option` is cache
+    // validity (`None` = invalidated); inner `Option` is the FR38 result,
+    // so an empty roster (no eligible creator) is cacheable too.
+    cached_top_creator: Cell<Option<Option<u32>>>,
     vote_scale: NonZeroU16,
     vote_interest: u8,
     // Smallest `av` for which `floor(av * vote_interest / vote_scale) >= vote_scale`.
@@ -83,25 +81,21 @@ pub struct VoteEngine<const MAX_NODES: usize> {
 impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// Constructs a `VoteEngine` with zero-initialized accumulated votes.
     ///
-    /// - `sub_seed` — deterministic PRNG seed derived by the blockchain via
-    ///   `Prng::derive_subseed("vote")`.
     /// - `vote_scale` / `vote_interest` — chain-config parameters read from
     ///   the caller's `ChainConfigTrait` at engine-construction time.
     ///   `vote_scale` is non-zero because FR37 uses it as both the denominator
     ///   of the anti-capture interest rule and the maximum per-block interest
     ///   bump. Each transaction vote credit is also worth one `vote_scale`.
     ///
-    /// Architectural divergence: the architecture §3.4 signature is
-    /// `new(sub_seed: u64)`. Story 3.1 accepts `vote_scale` / `vote_interest`
-    /// as construction parameters so `apply_block(block)` retains the clean
-    /// architectural signature. If chain-config becomes dynamic in a later
-    /// story, the engine can be re-parameterized.
-    pub fn new(sub_seed: u64, vote_scale: NonZeroU16, vote_interest: u8) -> Self {
+    /// The engine is fully deterministic and takes no PRNG seed — FR38
+    /// creator ordering needs no randomness (architecture §2.3, 2026-07-04
+    /// revision). If chain-config becomes dynamic in a later story, the
+    /// engine can be re-parameterized.
+    pub fn new(vote_scale: NonZeroU16, vote_interest: u8) -> Self {
         let cap_threshold = Self::compute_cap_threshold(vote_scale, vote_interest);
         Self {
             accumulated_vote: [0u32; MAX_NODES],
             cached_top_creator: Cell::new(None),
-            sub_seed_prng: Xoshiro256PlusPlus::seed_from_u64(sub_seed),
             vote_scale,
             vote_interest,
             cap_threshold,
@@ -307,35 +301,66 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// Interest rollback uses an exact monotonic inverse search for the configured
     /// capped growth function. If a post-interest value is not reachable, the method
     /// returns [`VoteEngineError::UnreachableInterestState`] rather than guessing.
+    ///
+    /// Atomic on failure: every node's post-undo value is preflighted before
+    /// any slot is written (the same fail-closed discipline as
+    /// [`apply_block`](Self::apply_block)), so an error leaves the
+    /// accumulated-vote state unchanged.
     pub fn undo_block(&mut self, block: BlockView<'_>) -> Result<(), VoteEngineError> {
         // Invalidate the cache first for safety (mirrors apply_block discipline).
         self.cached_top_creator.set(None);
 
         let creator_idx = block.creator() as usize;
-        let vote_scale = self.vote_scale_u32();
-
-        // === Step 4 rollback: deviation-block penalty reversal ===
         // Ordinary blocks carry `consumed_votes_from_first_voted_node == 0`; only
-        // deviation blocks record the penalized node's pre-penalty snapshot here.
+        // deviation blocks record the penalized node's pre-penalty snapshot.
         let consumed_from_first = block.consumed_votes_from_first_voted_node();
-        if consumed_from_first > 0 {
-            let victim = block.first_voted_node() as usize;
-            if victim < MAX_NODES {
-                self.accumulated_vote[victim] = consumed_from_first;
-            }
+        let victim = if consumed_from_first > 0 {
+            let victim_idx = block.first_voted_node() as usize;
+            (victim_idx < MAX_NODES).then_some((victim_idx, consumed_from_first))
+        } else {
+            None
+        };
+
+        // Preflight: compute every node's post-undo value without mutating, so
+        // arithmetic errors fail closed and leave the state unchanged.
+        for node_id in 0..MAX_NODES {
+            self.undo_value_for(node_id, &block, creator_idx, victim)?;
         }
 
-        // === Step 3 rollback: creator reset ===
-        // Restore the creator's slot from the header snapshot (post-interest,
-        // post-credit value that step 3 wiped).
-        if creator_idx < MAX_NODES {
-            self.accumulated_vote[creator_idx] = block.consumed_votes();
+        // Commit: repeat the identical per-node computation, now writing. Each
+        // node's value depends only on its own pre-undo slot plus the block,
+        // so in-place writes cannot influence later nodes.
+        for node_id in 0..MAX_NODES {
+            self.accumulated_vote[node_id] =
+                self.undo_value_for(node_id, &block, creator_idx, victim)?;
         }
+        Ok(())
+    }
 
-        // === Step 2 rollback: subtract vote credits ===
-        // Mirror the FR51 skip: zero-input UTXO carry-forward complex
-        // transactions contributed no credit forward, so they contribute no
-        // reversal backward.
+    /// Computes one node's post-undo accumulated vote from the current state
+    /// and the block header/payload, without mutating anything. Reverses the
+    /// FR37 steps for that node in reverse order:
+    ///
+    /// - Step 4/3 rollback (base selection): the creator slot restores from
+    ///   `consumed_votes`, the deviation victim from
+    ///   `consumed_votes_from_first_voted_node`. Step 3 ran after step 4
+    ///   forward, so the creator snapshot wins when both name the same node.
+    /// - Step 2 rollback: subtract one `vote_scale` per credit the block's
+    ///   payload gave this node (FR51 zero-input carry-forward skip mirrored).
+    /// - Step 1 rollback: exact pre-image of the capped interest growth.
+    fn undo_value_for(
+        &self,
+        node_id: usize,
+        block: &BlockView<'_>,
+        creator_idx: usize,
+        victim: Option<(usize, u32)>,
+    ) -> Result<u32, VoteEngineError> {
+        let mut value = match victim {
+            _ if node_id == creator_idx => block.consumed_votes(),
+            Some((victim_idx, consumed)) if victim_idx == node_id => consumed,
+            _ => self.accumulated_vote[node_id],
+        };
+
         if let Some(payload) = block.transactions() {
             for tx in payload.iter() {
                 if let Some(complex) = tx.as_complex() {
@@ -343,26 +368,15 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
                         continue;
                     }
                 }
-                let target = tx.vote() as usize;
-                if target >= MAX_NODES {
-                    continue;
+                if tx.vote() as usize == node_id {
+                    value = value
+                        .checked_sub(self.vote_scale_u32())
+                        .ok_or(VoteEngineError::AccumulatedVoteUnderflow)?;
                 }
-                self.accumulated_vote[target] = self.accumulated_vote[target]
-                    .checked_sub(vote_scale)
-                    .ok_or(VoteEngineError::AccumulatedVoteUnderflow)?;
             }
         }
 
-        // === Step 1 rollback: inverse anti-capture interest ===
-        // Applies to every node (including the creator), mirroring forward
-        // step 1 which also touched every node. After the creator's slot was
-        // restored via consumed_votes above and adjusted for any self-credits,
-        // this inverse pulls it back to its pre-interest value.
-        for node_id in 0..MAX_NODES {
-            self.accumulated_vote[node_id] =
-                self.undo_growth_value(self.accumulated_vote[node_id])?;
-        }
-        Ok(())
+        self.undo_growth_value(value)
     }
 
     /// Seeds accumulated-vote state from a balance-block snapshot (FR50).
@@ -401,31 +415,35 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// Returns the currently expected block creator per FR38.
     ///
     /// Ordering: descending by `accumulated_vote`, tie-broken by ascending
-    /// `node_id`. Nodes with `accumulated_vote == 0` are ineligible; if every
-    /// node has a zero vote, returns `None`.
+    /// `node_id`. Zero-vote nodes are ranked too (after every non-zero node),
+    /// so the all-zero bootstrap state yields node 0 and the network can
+    /// start. Returns `None` only in the degenerate `MAX_NODES == 0`
+    /// configuration.
     ///
     /// Compute-on-demand with cache: the first call after a write (apply /
     /// undo / seed) recomputes and caches the result in `cached_top_creator`;
     /// subsequent calls short-circuit through the cache until the next write
     /// invalidates it.
     ///
-    /// `_deadline_seq` and `_now` are accepted per architecture §3.4 but not
-    /// consumed in Story 3.3. Epic 8 (FR44 / FR46) will use them to advance
-    /// the grace-period admitted set.
-    pub fn top_creator(&self, _deadline_seq: u32, _now: u64) -> Option<u32> {
+    /// Deadline and grace-period progression are deliberately **not** this
+    /// crate's concern: the blockchain module (Epic 8 / FR44–FR47) owns the
+    /// deadline registry and, as the grace period expands, walks the same
+    /// projection via [`creator_at_rank`](Self::creator_at_rank).
+    pub fn top_creator(&self) -> Option<u32> {
         if let Some(cached) = self.cached_top_creator.get() {
-            return Some(cached);
+            return cached;
         }
         let computed = self.compute_top_creator();
-        self.cached_top_creator.set(computed);
+        self.cached_top_creator.set(Some(computed));
         computed
     }
 
     /// Returns the `rank`-th creator in the FR38 descending-by-vote order.
     ///
     /// `rank == 0` is equivalent to `top_creator`. `rank == 1` is the
-    /// second-eligible, and so on. Returns `None` when fewer than `rank + 1`
-    /// eligible (non-zero-vote) nodes exist.
+    /// second entry, and so on. The order is total over all `MAX_NODES`
+    /// slots — zero-vote nodes form its tail in ascending-id order — so
+    /// `None` is returned only when `rank >= MAX_NODES`.
     ///
     /// Not cached — O(N × (rank + 1)) via repeated linear scans. Epic 8 /
     /// FR44 walks the top few ranks for grace-period expansion; profiling
@@ -438,11 +456,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         for _ in 0..=rank {
             let mut best: Option<(u32, u32)> = None;
             for node_id in 0..MAX_NODES {
-                let av = self.accumulated_vote[node_id];
-                if av == 0 {
-                    continue;
-                }
-                let key = (av, node_id as u32);
+                let key = (self.accumulated_vote[node_id], node_id as u32);
                 // Skip candidates that come at or before the cursor in the
                 // (vote_desc, node_id_asc) ordering — those are already-ranked
                 // entries.
@@ -461,12 +475,59 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
                 }
             }
             if best.is_none() {
-                // Fewer than rank+1 eligible nodes.
+                // `rank >= MAX_NODES` — the total order is exhausted.
                 return None;
             }
             cursor = best;
         }
         cursor.map(|(_, node_id)| node_id)
+    }
+
+    /// Returns whether `node_id` falls within the top-`rank` band of the
+    /// FR38 creator order — `rank == 1` means "is the top creator",
+    /// `rank == 2` means "top creator or second-eligible", and so on
+    /// (`is_creator_within_rank(k, x)` ⇔ `creator_at_rank(r) == Some(x)` for
+    /// some `r < k`).
+    ///
+    /// `rank == 0` denotes an empty band and always returns `false`, as do
+    /// out-of-bounds `node_id` values. Zero-vote nodes are ranked (they form
+    /// the ascending-id tail of the order), so at bootstrap the lowest node
+    /// ids fill the band.
+    ///
+    /// `rank == 1` asks "is this the top creator" and short-circuits to the
+    /// cached [`top_creator`](Self::top_creator) — O(1) on a cache hit, and
+    /// a miss fills the cache. Larger bands run a single O(MAX_NODES) scan
+    /// with early exit: `node_id` is in the band iff fewer than `rank` nodes
+    /// precede it in the (vote descending, node-id ascending) order.
+    /// Intended as the frequent Epic 8 / FR44 admitted-set membership check.
+    pub fn is_creator_within_rank(&self, rank: usize, node_id: u32) -> bool {
+        let idx = node_id as usize;
+        if rank == 0 || idx >= MAX_NODES {
+            return false;
+        }
+        // The band of size 1 is exactly the top creator — serve it from the
+        // cached top_creator() path (O(1) on a cache hit; a miss fills the
+        // cache for the frequent per-block queries).
+        if rank == 1 {
+            return self.top_creator() == Some(node_id);
+        }
+        let own_vote = self.accumulated_vote[idx];
+        // Count nodes strictly ahead of `node_id` in the
+        // (vote_desc, node_id_asc) order; bail as soon as the band is full.
+        let mut ahead = 0usize;
+        for other_id in 0..MAX_NODES {
+            if other_id == idx {
+                continue;
+            }
+            let other_vote = self.accumulated_vote[other_id];
+            if other_vote > own_vote || (other_vote == own_vote && other_id < idx) {
+                ahead += 1;
+                if ahead >= rank {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Linear-scan implementation of FR38 top-creator selection. Called by
@@ -477,9 +538,6 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         let mut top: Option<(u32, u32)> = None;
         for node_id in 0..MAX_NODES {
             let av = self.accumulated_vote[node_id];
-            if av == 0 {
-                continue;
-            }
             match top {
                 None => top = Some((node_id as u32, av)),
                 Some((_, top_vote)) if av > top_vote => top = Some((node_id as u32, av)),
@@ -497,6 +555,9 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         let idx = node_id as usize;
         if idx < MAX_NODES {
             self.accumulated_vote[idx] = value;
+            // Mirror the runtime write paths: any vote mutation invalidates
+            // the top-creator cache.
+            self.cached_top_creator.set(None);
         }
     }
 }
@@ -632,16 +693,17 @@ mod tests {
 
     #[test]
     fn new_zero_state() {
-        let engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         for i in 0..TEST_MAX_NODES {
             assert_eq!(engine.accumulated_vote[i], 0);
         }
-        assert!(engine.top_creator(0, 0).is_none());
+        // All-zero order is headed by node 0 (bootstrap rule).
+        assert_eq!(engine.top_creator(), Some(0));
     }
 
     #[test]
     fn apply_block_step1_zero_stays_zero() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         let crypto = test_crypto();
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_empty_block(3, &mut buf, &crypto);
@@ -655,7 +717,7 @@ mod tests {
 
     #[test]
     fn apply_block_step1_interest_then_creator_reset() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 2000); // non-creator
         engine.set_accumulated_vote_for_test(5, 5000); // non-creator
         engine.set_accumulated_vote_for_test(3, 3000); // creator
@@ -676,7 +738,7 @@ mod tests {
 
     #[test]
     fn apply_block_interest_bump_is_capped_at_vote_scale() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         // raw bump = floor(40_000 * 50 / 1000) = 2000, capped to vote_scale = 1000.
         engine.set_accumulated_vote_for_test(2, 40_000);
 
@@ -691,7 +753,7 @@ mod tests {
 
     #[test]
     fn apply_block_reports_overflow_instead_of_saturating() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, u32::MAX - 999);
 
         let crypto = test_crypto();
@@ -706,7 +768,7 @@ mod tests {
 
     #[test]
     fn apply_block_step2_vote_credit() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         let crypto = test_crypto();
         let nt = nt_with_vote(5);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
@@ -720,7 +782,7 @@ mod tests {
     #[test]
     fn apply_block_step2_node0_permanent_target() {
         // Creator = 3 (not 0), so step 3 does NOT wipe node 0.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         let crypto = test_crypto();
         let nt = nt_with_vote(0);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
@@ -735,7 +797,7 @@ mod tests {
     fn apply_block_step2_zero_input_utxo_no_credit() {
         // Complex tx with `input_count == 0` (carry-forward) contributes no
         // vote credit even if `vote != 0`.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         let crypto = test_crypto();
         let complex = ComplexTransaction::new(7);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
@@ -748,7 +810,7 @@ mod tests {
 
     #[test]
     fn apply_block_step3_creator_reset() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(3, 8000);
 
         let crypto = test_crypto();
@@ -763,7 +825,7 @@ mod tests {
     #[test]
     fn apply_block_creator_self_vote_does_not_retain() {
         // Creator = 3, tx votes for node 3 (self). Step 3 wipes step 2.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         let crypto = test_crypto();
         let nt = nt_with_vote(3);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
@@ -778,7 +840,7 @@ mod tests {
     fn apply_block_deviation_penalty() {
         // Deviation block: creator = 5, first_voted_node = 2,
         // consumed_votes_from_first_voted_node = 1. Node 2 reset.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 4000);
 
         let crypto = test_crypto();
@@ -794,7 +856,7 @@ mod tests {
     fn apply_block_ordinary_block_no_deviation_penalty() {
         // Ordinary block: `consumed_votes_from_first_voted_node == 0` — no
         // deviation reset. Node 4 gets the interest bump instead.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(4, 4000);
 
         let crypto = test_crypto();
@@ -809,10 +871,10 @@ mod tests {
 
     #[test]
     fn apply_block_deterministic_replay() {
-        // Two engines seeded identically must reach identical state.
-        fn run(seed: u64) -> [u32; TEST_MAX_NODES] {
+        // Two engines fed the identical block sequence must reach identical state.
+        fn run() -> [u32; TEST_MAX_NODES] {
             let crypto = test_crypto();
-            let mut engine = TestEngine::new(seed, test_vote_scale(), TEST_VOTE_INTEREST);
+            let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
 
             let mut buf1 = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
             let nt1 = nt_with_vote(5);
@@ -831,33 +893,30 @@ mod tests {
             engine.accumulated_vote
         }
 
-        let a = run(0xDEAD_BEEF);
-        let b = run(0xDEAD_BEEF);
-        assert_eq!(
-            a, b,
-            "identical seed + op sequence must yield identical state"
-        );
+        let a = run();
+        let b = run();
+        assert_eq!(a, b, "identical op sequence must yield identical state");
     }
 
     #[test]
     fn apply_block_invalidates_cached_top_creator() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         // Directly poison the cache so we can observe the invalidation.
-        engine.cached_top_creator.set(Some(42));
+        engine.cached_top_creator.set(Some(Some(42)));
 
         let crypto = test_crypto();
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_empty_block(3, &mut buf, &crypto);
         engine.apply_block(block).expect("apply block must succeed");
 
-        // apply_block called set(None); no eligible nodes remain, so the
-        // recompute-on-read returns None.
-        assert!(engine.top_creator(0, 0).is_none());
+        // apply_block called set(None); all votes are zero, so the
+        // recompute-on-read returns the bootstrap order head: node 0.
+        assert_eq!(engine.top_creator(), Some(0));
     }
 
     #[test]
     fn accumulated_vote_of_out_of_bounds_returns_zero() {
-        let engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         assert_eq!(engine.accumulated_vote_of(TEST_MAX_NODES as u32), 0);
         assert_eq!(engine.accumulated_vote_of(u32::MAX), 0);
     }
@@ -870,7 +929,7 @@ mod tests {
     fn undo_reverses_step3_creator_reset() {
         // Post-interest value = 2000 + min(floor(2000 * 50 / 1000), 1000) = 2100.
         // The block header records that pre-reset value in `consumed_votes`.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(3, 2000);
 
         let crypto = test_crypto();
@@ -895,7 +954,7 @@ mod tests {
     fn undo_reverses_step2_vote_credit() {
         // Apply a block whose payload credits node 5 (via a NodeTransfer with
         // vote = 5). Undo must subtract the credit.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         let crypto = test_crypto();
         let nt = nt_with_vote(5);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
@@ -917,7 +976,7 @@ mod tests {
     #[test]
     fn undo_reverses_step1_interest_values() {
         // Apply an empty block, then undo — nodes must be exactly restored.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 2000);
         engine.set_accumulated_vote_for_test(5, 5000);
         engine.set_accumulated_vote_for_test(7, 100);
@@ -949,7 +1008,7 @@ mod tests {
     fn undo_reverses_step1_interest_non_multiple_values() {
         // Values that used to fail under the old closed-form floor inverse now
         // round-trip through the exact monotonic inverse search.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 19); // bump 0, reachable after stays 19
         engine.set_accumulated_vote_for_test(5, 21); // bump 1, reachable after is 22
 
@@ -978,7 +1037,7 @@ mod tests {
         // Covers the capped linear region (fast-path inverse), the exact
         // fast-path boundary (`after == cap_threshold + vote_scale`), and a
         // just-below-threshold value that must take the binary-search path.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 20_000); // at threshold: bump capped to 1000
         engine.set_accumulated_vote_for_test(5, 25_000); // inside capped region
         engine.set_accumulated_vote_for_test(7, 19_999); // below threshold: raw bump 999
@@ -1011,7 +1070,7 @@ mod tests {
         // exceeds the value itself. The tightened search lower bound
         // `after - bump(after)` must saturate at zero instead of underflowing.
         let scale = NonZeroU16::new(2).expect("test vote scale must be non-zero");
-        let mut engine = VoteEngine::<TEST_MAX_NODES>::new(0x1234, scale, 255);
+        let mut engine = VoteEngine::<TEST_MAX_NODES>::new(scale, 255);
         let crypto = test_crypto();
 
         // Reachable round trip: 1 -> 3 (bump capped at vote_scale) -> 1.
@@ -1042,7 +1101,7 @@ mod tests {
         // With bump(x) = floor(x / 20), f(1959) = 2056 and f(1960) = 2058:
         // 2057 has no pre-image under the configured growth function, so the
         // interest rollback must report it instead of guessing a nearby value.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 2057);
 
         let crypto = test_crypto();
@@ -1058,6 +1117,52 @@ mod tests {
     }
 
     #[test]
+    fn undo_unreachable_error_leaves_state_unchanged() {
+        // av[5] = 2057 has no interest pre-image; av[2] = 5000 does. The
+        // preflight must reject the block before any slot (including the
+        // reachable av[2]) is rewritten.
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(2, 5000);
+        engine.set_accumulated_vote_for_test(5, 2057);
+        let pre_state = engine.accumulated_vote;
+
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_empty_block(4, &mut buf, &crypto);
+
+        let result = engine.undo_block(block);
+
+        assert_eq!(result, Err(VoteEngineError::UnreachableInterestState));
+        assert_eq!(
+            engine.accumulated_vote, pre_state,
+            "failed undo must not mutate state"
+        );
+    }
+
+    #[test]
+    fn undo_underflow_error_leaves_state_unchanged() {
+        // The block's payload credits node 5, but av[5] = 500 < vote_scale, so
+        // the step-2 rollback underflows. Every slot must stay untouched.
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(2, 5000);
+        engine.set_accumulated_vote_for_test(5, 500);
+        let pre_state = engine.accumulated_vote;
+
+        let crypto = test_crypto();
+        let nt = nt_with_vote(5);
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_block_view(3, 0, 0, 0, Some(nt.as_bytes()), &mut buf, &crypto);
+
+        let result = engine.undo_block(block);
+
+        assert_eq!(result, Err(VoteEngineError::AccumulatedVoteUnderflow));
+        assert_eq!(
+            engine.accumulated_vote, pre_state,
+            "failed undo must not mutate state"
+        );
+    }
+
+    #[test]
     fn undo_reverses_deviation_penalty() {
         // Deviation block: creator = 5, first_voted_node = 3.
         // Pre-apply av[3] = 4000. Forward step 1 bumps to 4200 before step 4 wipes; that is the value
@@ -1065,7 +1170,7 @@ mod tests {
         // apply_block comment ("post-interest, post-credit, pre-penalty").
         // Undo restores av[3] = 4200 (step 4 rollback), then step 1 reverse
         // pulls it back to 4000.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(3, 4000);
 
         let crypto = test_crypto();
@@ -1089,7 +1194,7 @@ mod tests {
     fn apply_undo_round_trip_multi_block() {
         // The exact monotonic inverse supports arbitrary reachable values across
         // multiple blocks, not only values that satisfy a divisibility invariant.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 8000);
         let pre_state = engine.accumulated_vote;
 
@@ -1145,7 +1250,7 @@ mod tests {
 
     #[test]
     fn seed_from_balance_block_populates_snapshots() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         let crypto = test_crypto();
         let pk = [0xBBu8; 32];
         let entries = [
@@ -1174,7 +1279,7 @@ mod tests {
     fn seed_from_balance_block_ignores_non_balance_block() {
         // Pass a transaction block — `balances()` returns None so the seed is
         // a defensive no-op. Pre-existing state stays unchanged.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 4000);
 
         let crypto = test_crypto();
@@ -1192,7 +1297,7 @@ mod tests {
     fn seed_from_balance_block_bounds_checks_owner() {
         // Owner id at TEST_MAX_NODES is out of bounds — must be silently
         // skipped without panicking, and in-bounds slots stay unchanged.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 4000);
 
         let crypto = test_crypto();
@@ -1221,64 +1326,73 @@ mod tests {
     // ==================================================================
 
     #[test]
-    fn top_creator_empty_state_returns_none() {
-        let engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
-        assert_eq!(engine.top_creator(0, 0), None);
+    fn top_creator_all_zero_bootstrap_starts_at_node_zero() {
+        // Bootstrap: every accumulated vote is zero, yet the network must be
+        // able to start — the order degrades to pure ascending node id, so
+        // node 0 (genesis) is the expected creator and low ids fill the band.
+        let engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        assert_eq!(engine.top_creator(), Some(0));
+        assert_eq!(engine.creator_at_rank(0), Some(0));
+        assert_eq!(engine.creator_at_rank(1), Some(1));
+        assert!(engine.is_creator_within_rank(1, 0));
+        assert!(!engine.is_creator_within_rank(1, 1));
+        assert!(engine.is_creator_within_rank(2, 1));
     }
 
     #[test]
     fn top_creator_single_node_returns_that_node() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(5, 100);
-        assert_eq!(engine.top_creator(0, 0), Some(5));
+        assert_eq!(engine.top_creator(), Some(5));
     }
 
     #[test]
     fn top_creator_returns_highest_accumulated_vote() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 100);
         engine.set_accumulated_vote_for_test(5, 300);
         engine.set_accumulated_vote_for_test(7, 200);
-        assert_eq!(engine.top_creator(0, 0), Some(5));
+        assert_eq!(engine.top_creator(), Some(5));
     }
 
     #[test]
     fn top_creator_ties_broken_by_ascending_node_id() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         // Equal votes on nodes 2, 5, 11 — node 2 (lowest id) must win.
         engine.set_accumulated_vote_for_test(2, 500);
         engine.set_accumulated_vote_for_test(5, 500);
         engine.set_accumulated_vote_for_test(11, 500);
-        assert_eq!(engine.top_creator(0, 0), Some(2));
+        assert_eq!(engine.top_creator(), Some(2));
     }
 
     #[test]
-    fn top_creator_ignores_zero_vote_nodes() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
-        // Only node 9 is non-zero; nodes 0-8 and 10-15 are zero.
+    fn top_creator_ranks_nonzero_vote_above_zero_vote() {
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        // Only node 9 is non-zero — it outranks every zero-vote node,
+        // including the lower ids.
         engine.set_accumulated_vote_for_test(9, 42);
-        assert_eq!(engine.top_creator(0, 0), Some(9));
+        assert_eq!(engine.top_creator(), Some(9));
     }
 
     #[test]
     fn top_creator_cached_between_reads() {
         // Two consecutive reads without an invalidating write must return the
         // same result — the second read is served from the cache.
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(7, 300);
-        let first = engine.top_creator(0, 0);
-        let second = engine.top_creator(0, 0);
+        let first = engine.top_creator();
+        let second = engine.top_creator();
         assert_eq!(first, Some(7));
         assert_eq!(first, second);
     }
 
     #[test]
     fn top_creator_recomputes_after_apply_block_invalidation() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(5, 200);
         engine.set_accumulated_vote_for_test(7, 100);
         // Prime the cache: top_creator = 5.
-        assert_eq!(engine.top_creator(0, 0), Some(5));
+        assert_eq!(engine.top_creator(), Some(5));
 
         // Apply a block where node 5 is the creator — step 3 resets av[5] to 0.
         // After apply: av[5] = 0, av[7] = 105 (interest bump). Top becomes 7.
@@ -1287,16 +1401,16 @@ mod tests {
         let block = make_empty_block(5, &mut buf, &crypto);
         engine.apply_block(block).expect("apply block must succeed");
 
-        assert_eq!(engine.top_creator(0, 0), Some(7));
+        assert_eq!(engine.top_creator(), Some(7));
     }
 
     #[test]
     fn top_creator_recomputes_after_undo_block_invalidation() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(3, 2000);
         engine.set_accumulated_vote_for_test(7, 100);
         // Prime the cache with the state where node 3 is top.
-        assert_eq!(engine.top_creator(0, 0), Some(3));
+        assert_eq!(engine.top_creator(), Some(3));
 
         // Apply a block where node 3 is creator (resets av[3] to 0). Then
         // undo it — av[3] should be restored to 2000, and top_creator should
@@ -1306,7 +1420,7 @@ mod tests {
         let block = make_block_view(3, 2100, 0, 0, None, &mut buf, &crypto);
         engine.apply_block(block).expect("apply block must succeed");
         // After apply: av[3] = 0, av[7] = 105 → top = 7.
-        assert_eq!(engine.top_creator(0, 0), Some(7));
+        assert_eq!(engine.top_creator(), Some(7));
 
         let block_for_undo = BlockView::from_bytes(&buf[..])
             .ok()
@@ -1316,15 +1430,15 @@ mod tests {
             .expect("undo block must succeed");
 
         // After undo: av[3] = 2000, av[7] = 100 → top = 3 again.
-        assert_eq!(engine.top_creator(0, 0), Some(3));
+        assert_eq!(engine.top_creator(), Some(3));
     }
 
     #[test]
     fn top_creator_recomputes_after_seed_from_balance_block_invalidation() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 100);
         // Prime the cache: node 2 is top.
-        assert_eq!(engine.top_creator(0, 0), Some(2));
+        assert_eq!(engine.top_creator(), Some(2));
 
         // Seed a balance block that reseeds node 5 with a much larger vote —
         // top should recompute to 5 after the invalidation.
@@ -1335,12 +1449,12 @@ mod tests {
         let block = make_balance_block(&entries, &mut buf, &crypto);
         engine.seed_from_balance_block(block);
 
-        assert_eq!(engine.top_creator(0, 0), Some(5));
+        assert_eq!(engine.top_creator(), Some(5));
     }
 
     #[test]
     fn creator_at_rank_matches_descending_order() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 100);
         engine.set_accumulated_vote_for_test(5, 300);
         engine.set_accumulated_vote_for_test(7, 200);
@@ -1351,31 +1465,36 @@ mod tests {
     }
 
     #[test]
-    fn creator_at_rank_returns_none_beyond_eligible_count() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+    fn creator_at_rank_covers_zero_vote_tail_and_ends_at_max_nodes() {
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 100);
         engine.set_accumulated_vote_for_test(5, 300);
         engine.set_accumulated_vote_for_test(7, 200);
-        // Only 3 eligible nodes.
-        assert_eq!(engine.creator_at_rank(3), None);
+        // Ranks 0-2 are the non-zero nodes; the zero-vote tail follows in
+        // ascending-id order (0, 1, 3, 4, ...).
+        assert_eq!(engine.creator_at_rank(3), Some(0));
+        assert_eq!(engine.creator_at_rank(4), Some(1));
+        assert_eq!(engine.creator_at_rank(5), Some(3));
+        // The order is total over all MAX_NODES slots and ends there.
+        assert_eq!(engine.creator_at_rank(TEST_MAX_NODES - 1), Some(15));
         assert_eq!(engine.creator_at_rank(TEST_MAX_NODES), None);
     }
 
     #[test]
     fn creator_at_rank_zero_matches_top_creator() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 100);
         engine.set_accumulated_vote_for_test(5, 500);
         engine.set_accumulated_vote_for_test(9, 500); // tied with 5, higher id
 
-        assert_eq!(engine.creator_at_rank(0), engine.top_creator(0, 0));
+        assert_eq!(engine.creator_at_rank(0), engine.top_creator());
         // And that shared answer is the lowest-id tie-winner among the top-vote group.
         assert_eq!(engine.creator_at_rank(0), Some(5));
     }
 
     #[test]
     fn creator_at_rank_ties_broken_by_ascending_node_id() {
-        let mut engine = TestEngine::new(0x1234, test_vote_scale(), TEST_VOTE_INTEREST);
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(2, 500);
         engine.set_accumulated_vote_for_test(5, 500);
         engine.set_accumulated_vote_for_test(11, 500);
@@ -1384,6 +1503,117 @@ mod tests {
         assert_eq!(engine.creator_at_rank(0), Some(2));
         assert_eq!(engine.creator_at_rank(1), Some(5));
         assert_eq!(engine.creator_at_rank(2), Some(11));
-        assert_eq!(engine.creator_at_rank(3), None);
+        // The zero-vote tail starts right after: lowest zero-vote id is 0.
+        assert_eq!(engine.creator_at_rank(3), Some(0));
+    }
+
+    #[test]
+    fn is_creator_within_rank_top_band() {
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(2, 100);
+        engine.set_accumulated_vote_for_test(5, 300);
+        engine.set_accumulated_vote_for_test(7, 200);
+
+        // rank 1 == "is the top creator".
+        assert!(engine.is_creator_within_rank(1, 5));
+        assert!(!engine.is_creator_within_rank(1, 7));
+        assert!(!engine.is_creator_within_rank(1, 2));
+    }
+
+    #[test]
+    fn is_creator_within_rank_band_membership() {
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(2, 100);
+        engine.set_accumulated_vote_for_test(5, 300);
+        engine.set_accumulated_vote_for_test(7, 200);
+
+        // rank 2 band = {5, 7}.
+        assert!(engine.is_creator_within_rank(2, 5));
+        assert!(engine.is_creator_within_rank(2, 7));
+        assert!(!engine.is_creator_within_rank(2, 2));
+        // rank 3 band covers all three eligible nodes.
+        assert!(engine.is_creator_within_rank(3, 2));
+    }
+
+    #[test]
+    fn is_creator_within_rank_ties_follow_ascending_node_id() {
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(2, 500);
+        engine.set_accumulated_vote_for_test(5, 500);
+        engine.set_accumulated_vote_for_test(11, 500);
+
+        // Order under the tie-break: 2, 5, 11.
+        assert!(engine.is_creator_within_rank(1, 2));
+        assert!(!engine.is_creator_within_rank(1, 5));
+        assert!(engine.is_creator_within_rank(2, 5));
+        assert!(!engine.is_creator_within_rank(2, 11));
+        assert!(engine.is_creator_within_rank(3, 11));
+    }
+
+    #[test]
+    fn is_creator_within_rank_zero_vote_tail_and_out_of_bounds() {
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(5, 100);
+
+        // Zero-vote nodes rank after the non-zero node in ascending-id
+        // order: 5, then 0, 1, 2, 3, 4, 6, 7, 8, 9, ... — node 9 sits at
+        // 0-based position 9, so it needs a band of at least 10.
+        assert!(engine.is_creator_within_rank(TEST_MAX_NODES, 9));
+        assert!(!engine.is_creator_within_rank(9, 9));
+        assert!(engine.is_creator_within_rank(10, 9));
+        // Out-of-bounds ids are never in any band.
+        assert!(!engine.is_creator_within_rank(1, TEST_MAX_NODES as u32));
+        assert!(!engine.is_creator_within_rank(1, u32::MAX));
+    }
+
+    #[test]
+    fn is_creator_within_rank_zero_rank_is_empty_band() {
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(5, 100);
+        // rank 0 = empty band — even the top creator is outside it.
+        assert!(!engine.is_creator_within_rank(0, 5));
+    }
+
+    #[test]
+    fn is_creator_within_rank_one_uses_cached_top_creator() {
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(5, 300);
+        engine.set_accumulated_vote_for_test(7, 200);
+
+        // The rank-1 fast path routes through top_creator() and fills its cache.
+        assert!(engine.cached_top_creator.get().is_none());
+        assert!(engine.is_creator_within_rank(1, 5));
+        assert_eq!(engine.cached_top_creator.get(), Some(Some(5)));
+
+        // Cache-consistent answer for a non-top id.
+        assert!(!engine.is_creator_within_rank(1, 7));
+
+        // A write invalidates the cache; the fast path recomputes the new top.
+        engine.set_accumulated_vote_for_test(7, 400);
+        assert!(engine.is_creator_within_rank(1, 7));
+        assert!(!engine.is_creator_within_rank(1, 5));
+    }
+
+    #[test]
+    fn is_creator_within_rank_matches_creator_at_rank() {
+        // Cross-check the O(N) membership scan against the rank walk:
+        // membership in the top-k band ⇔ creator_at_rank(r) hits the node
+        // for some r < k.
+        let mut engine = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(1, 50);
+        engine.set_accumulated_vote_for_test(3, 500);
+        engine.set_accumulated_vote_for_test(6, 500);
+        engine.set_accumulated_vote_for_test(9, 200);
+
+        for band in 0..=5usize {
+            for node in 0..TEST_MAX_NODES {
+                let expected = (0..band).any(|r| engine.creator_at_rank(r) == Some(node as u32));
+                assert_eq!(
+                    engine.is_creator_within_rank(band, node as u32),
+                    expected,
+                    "band={band} node={node}"
+                );
+            }
+        }
     }
 }
