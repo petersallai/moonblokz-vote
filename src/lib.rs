@@ -93,6 +93,39 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         }
     }
 
+    /// In-place construction for embedded/task use: writes directly into
+    /// caller-provided `dst` instead of returning `Self` by value.
+    ///
+    /// `accumulated_vote` is `MAX_NODES * 4` bytes (~3.9 KB at the
+    /// architecture §5 default `MAX_NODES = 1000`) — see
+    /// `moonblokz_blockchain::api::Blockchain::init_in_place`'s doc
+    /// comment for the full mechanism and the required usage pattern
+    /// (call from *inside* a `#[embassy_executor::task]` fn, with the
+    /// destination `MaybeUninit` declared as a task-local kept alive
+    /// across an `.await`). [`Self::new`] remains the right constructor
+    /// for the desktop simulator and for tests.
+    ///
+    /// # Safety
+    /// `dst` must be valid for writes of `Self` and not yet initialized.
+    /// Every field is written exactly once; no field is read before its
+    /// write.
+    pub unsafe fn init_in_place(dst: *mut Self, vote_scale: NonZeroU16, vote_interest: u8) {
+        let cap_threshold = Self::compute_cap_threshold(vote_scale, vote_interest);
+        unsafe {
+            // All-zero `u32` array: `write_bytes` (memset) is correct (no
+            // representation ambiguity for a primitive integer) and never
+            // materializes a `MAX_NODES * 4`-byte value anywhere, unlike a
+            // bulk `.write([0u32; MAX_NODES])` would. `count` here is a
+            // count of `u32` elements, not bytes.
+            let accumulated_vote_ptr = core::ptr::addr_of_mut!((*dst).accumulated_vote) as *mut u32;
+            accumulated_vote_ptr.write_bytes(0u8, MAX_NODES);
+
+            core::ptr::addr_of_mut!((*dst).vote_scale).write(vote_scale);
+            core::ptr::addr_of_mut!((*dst).vote_interest).write(vote_interest);
+            core::ptr::addr_of_mut!((*dst).cap_threshold).write(cap_threshold);
+        }
+    }
+
     fn compute_cap_threshold(vote_scale: NonZeroU16, vote_interest: u8) -> u32 {
         if vote_interest == 0 {
             return u32::MAX;
@@ -659,6 +692,30 @@ mod tests {
         }
         // All-zero order is headed by node 0 (bootstrap rule).
         assert_eq!(engine.top_creator(), Some(0));
+    }
+
+    /// `init_in_place`'s `unsafe` per-field writes (out-param signature,
+    /// `accumulated_vote` filled via `write_bytes`) must produce a struct
+    /// indistinguishable from `new()`'s — verified directly rather than
+    /// trusted by construction.
+    #[test]
+    fn init_in_place_matches_new() {
+        let a = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+
+        let mut result = core::mem::MaybeUninit::<TestEngine>::uninit();
+        let b = unsafe {
+            TestEngine::init_in_place(result.as_mut_ptr(), test_vote_scale(), TEST_VOTE_INTEREST);
+            result.assume_init()
+        };
+
+        for i in 0..TEST_MAX_NODES {
+            assert_eq!(a.accumulated_vote[i], b.accumulated_vote[i]);
+            assert_eq!(a.accumulated_vote[i], 0);
+        }
+        assert_eq!(a.vote_scale, b.vote_scale);
+        assert_eq!(a.vote_interest, b.vote_interest);
+        assert_eq!(a.cap_threshold, b.cap_threshold);
+        assert_eq!(b.top_creator(), Some(0));
     }
 
     #[test]
