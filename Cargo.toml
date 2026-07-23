@@ -9,7 +9,20 @@ keywords = ["embedded", "no-std", "blockchain", "moonblokz", "vote"]
 categories = ["embedded", "no-std"]
 
 [dependencies]
-moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false, features = ["schnorr-crypto-bigint"] }
+# Backend-agnostic: do NOT pin a crypto backend here. The selected Schnorr
+# backend is chosen once at the top of the graph and forwarded down through the
+# `[features]` table below (a consumer overrides via `default-features = false`
+# + an alternate backend feature).
+moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false }
+
+[features]
+# The crypto backend is forwarded to `moonblokz-chain-types` (which forwards it
+# on to `moonblokz-crypto`). Exactly one must be active; the default is the
+# embedded-oriented crypto-bigint backend.
+default = ["schnorr-crypto-bigint"]
+schnorr-crypto-bigint = ["moonblokz-chain-types/schnorr-crypto-bigint"]
+schnorr-malachite = ["moonblokz-chain-types/schnorr-malachite"]
+schnorr-num-bigint-dig = ["moonblokz-chain-types/schnorr-num-bigint-dig"]
 
 # Test-only: needed to sign `BlockBuilder::build_signed(...)` fixtures.
 # Not linked into production builds — leaf-crate discipline holds on the
