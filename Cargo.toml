@@ -16,6 +16,11 @@ categories = ["embedded", "no-std"]
 moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = false }
 
 [features]
+# Test oracle: enables the by-value `VoteEngine::new()` (the executable
+# specification the in-place `init` is checked against) and a `PartialEq`
+# derive for that comparison. Never enabled in production builds; downstream
+# crates turn it on from their `[dev-dependencies]` only.
+test-oracle = []
 # The crypto backend is forwarded to `moonblokz-chain-types` (which forwards it
 # on to `moonblokz-crypto`). Exactly one must be active; the default is the
 # embedded-oriented crypto-bigint backend.

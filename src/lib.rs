@@ -61,6 +61,7 @@ pub enum VoteEngineError {
 ///
 /// Const generic:
 /// - `MAX_NODES`: workspace node-roster capacity (architecture §5 default: 1000).
+#[cfg_attr(any(test, feature = "test-oracle"), derive(PartialEq, Eq))]
 pub struct VoteEngine<const MAX_NODES: usize> {
     accumulated_vote: [u32; MAX_NODES],
     vote_scale: NonZeroU16,
@@ -71,9 +72,17 @@ pub struct VoteEngine<const MAX_NODES: usize> {
 }
 
 impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
-    /// In-place construction for embedded/task use, and this type's **only**
-    /// constructor: writes directly into caller-provided `dst` instead of
-    /// returning `Self` by value.
+    /// Constructs the engine in place, inside caller-provided storage, and
+    /// hands back a `&mut` to the initialized value. This is the type's
+    /// **only** constructor: there is no by-value `new()`, because `Self`
+    /// carries a `MAX_NODES * 4`-byte array (~3.9 KB at the architecture §5
+    /// default `MAX_NODES = 1000`) and no construction technique *inside* a
+    /// function that returns `Self` by value can avoid a
+    /// `size_of::<Self>()`-sized transient stack allocation somewhere.
+    /// Writing straight into `slot` sidesteps that floor entirely — see
+    /// `moonblokz_blockchain::api::Blockchain::init`'s doc comment for the
+    /// full mechanism and the required embedded usage pattern (a task-local
+    /// `MaybeUninit` kept alive across an `.await`).
     ///
     /// - `vote_scale` / `vote_interest` — chain-config parameters read from
     ///   the caller's `ChainConfigTrait` at engine-construction time.
@@ -84,24 +93,49 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// The engine is fully deterministic and takes no PRNG seed — FR38
     /// creator ordering needs no randomness (architecture §2.3, 2026-07-04
     /// revision). If chain-config becomes dynamic in a later story, the
-    /// engine can be re-parameterized.
+    /// engine can be re-parameterized through [`Self::reset`].
     ///
-    /// `accumulated_vote` is `MAX_NODES * 4` bytes (~3.9 KB at the
-    /// architecture §5 default `MAX_NODES = 1000`) — see
-    /// `moonblokz_blockchain::api::Blockchain::init_in_place`'s doc
-    /// comment for the full mechanism and the required usage pattern
-    /// (call from *inside* a `#[embassy_executor::task]` fn, with the
-    /// destination `MaybeUninit` declared as a task-local kept alive
-    /// across an `.await`). A by-value `new()` existed earlier and was fine
-    /// for the desktop simulator and for tests, but it was removed once
-    /// every caller was confirmed able to use this constructor instead
-    /// (same rationale as `Blockchain::init_in_place`'s doc comment).
+    /// This function is **safe**: a `&mut MaybeUninit<Self>` already
+    /// guarantees a non-null, aligned, exclusively borrowed destination that
+    /// is valid for writes, and the caller only receives the `&mut Self` once
+    /// every field has been written — a panic before that point leaves `slot`
+    /// uninitialized, which is a safe state (nothing is dropped). If `slot`
+    /// already held an initialized value it is leaked rather than dropped;
+    /// every field here is plain data, so that is a no-op.
+    pub fn init(
+        slot: &mut core::mem::MaybeUninit<Self>,
+        vote_scale: NonZeroU16,
+        vote_interest: u8,
+    ) -> &mut Self {
+        // SAFETY: `slot.as_mut_ptr()` is derived from a live `&mut
+        // MaybeUninit<Self>`, so it is non-null, aligned, valid for writes of
+        // `Self` and not aliased for the duration of this call.
+        unsafe { Self::write_fields(slot.as_mut_ptr(), vote_scale, vote_interest) };
+        // SAFETY: `write_fields` initialized every field of `Self`.
+        unsafe { slot.assume_init_mut() }
+    }
+
+    /// Re-parameterizes and empties a live engine in place (FR3 "not
+    /// resumable — clean working set on re-entry"): the same field writes as
+    /// [`Self::init`], applied over the existing value, so no `MAX_NODES`-
+    /// scaled temporary is ever materialized.
+    pub fn reset(&mut self, vote_scale: NonZeroU16, vote_interest: u8) {
+        // SAFETY: `self` is a live, exclusively borrowed `Self`, so the
+        // pointer is valid for writes. Every field is plain data with no
+        // `Drop`, so overwriting without dropping leaks nothing, and
+        // `write_fields` reads no prior value.
+        unsafe { Self::write_fields(self, vote_scale, vote_interest) };
+    }
+
+    /// The one invariant the type system cannot check for [`Self::init`]:
+    /// every field of `*p` is written, and none is read before its write.
+    /// Kept as the single body shared by [`Self::init`] and [`Self::reset`].
     ///
     /// # Safety
-    /// `dst` must be valid for writes of `Self` and not yet initialized.
-    /// Every field is written exactly once; no field is read before its
-    /// write.
-    pub unsafe fn init_in_place(dst: *mut Self, vote_scale: NonZeroU16, vote_interest: u8) {
+    /// `p` must be non-null, aligned and valid for writes of `Self`. The
+    /// memory may be uninitialized; any previous contents are overwritten
+    /// without being dropped.
+    unsafe fn write_fields(p: *mut Self, vote_scale: NonZeroU16, vote_interest: u8) {
         let cap_threshold = Self::compute_cap_threshold(vote_scale, vote_interest);
         unsafe {
             // All-zero `u32` array: `write_bytes` (memset) is correct (no
@@ -109,25 +143,43 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
             // materializes a `MAX_NODES * 4`-byte value anywhere, unlike a
             // bulk `.write([0u32; MAX_NODES])` would. `count` here is a
             // count of `u32` elements, not bytes.
-            let accumulated_vote_ptr = core::ptr::addr_of_mut!((*dst).accumulated_vote) as *mut u32;
+            let accumulated_vote_ptr = (&raw mut (*p).accumulated_vote).cast::<u32>();
             accumulated_vote_ptr.write_bytes(0u8, MAX_NODES);
 
-            core::ptr::addr_of_mut!((*dst).vote_scale).write(vote_scale);
-            core::ptr::addr_of_mut!((*dst).vote_interest).write(vote_interest);
-            core::ptr::addr_of_mut!((*dst).cap_threshold).write(cap_threshold);
+            (&raw mut (*p).vote_scale).write(vote_scale);
+            (&raw mut (*p).vote_interest).write(vote_interest);
+            (&raw mut (*p).cap_threshold).write(cap_threshold);
         }
     }
 
-    /// Test-only stand-in for the deleted by-value `new()`: wraps the
-    /// `MaybeUninit` + `init_in_place` + `assume_init()` calling convention
-    /// once so individual tests don't each repeat `unsafe` code.
+    /// The by-value constructor, kept as the **executable specification** of
+    /// [`Self::init`]: a plain struct literal, which the language forces to
+    /// name every field, so adding a field to `VoteEngine` is a compile error
+    /// here until the literal — and therefore the specification — is updated.
+    /// The equivalence test then holds `init` to it field by field.
+    ///
+    /// Test-only (`cfg(test)` or the `test-oracle` feature): returning `Self`
+    /// by value costs a `size_of::<Self>()`-sized transient, which is exactly
+    /// what `init` exists to avoid on the embedded stack. Never a production
+    /// code path.
+    #[cfg(any(test, feature = "test-oracle"))]
+    pub fn new(vote_scale: NonZeroU16, vote_interest: u8) -> Self {
+        Self {
+            accumulated_vote: [0u32; MAX_NODES],
+            vote_scale,
+            vote_interest,
+            cap_threshold: Self::compute_cap_threshold(vote_scale, vote_interest),
+        }
+    }
+
+    /// Test-only stand-in that goes through the production path: runs
+    /// [`Self::init`] into a local slot and moves the finished value out.
     #[cfg(test)]
     fn new_for_test(vote_scale: NonZeroU16, vote_interest: u8) -> Self {
         let mut slot = core::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            Self::init_in_place(slot.as_mut_ptr(), vote_scale, vote_interest);
-            slot.assume_init()
-        }
+        Self::init(&mut slot, vote_scale, vote_interest);
+        // SAFETY: `init` returned, so every field of `slot` is initialized.
+        unsafe { slot.assume_init() }
     }
 
     fn compute_cap_threshold(vote_scale: NonZeroU16, vote_interest: u8) -> u32 {
@@ -688,29 +740,90 @@ mod tests {
         NodeTransfer::new(vote, 0, 1, 0, 100, 1, 0, &sig)
     }
 
-    /// `init_in_place`'s `unsafe` per-field writes (out-param signature,
-    /// `accumulated_vote` filled via `write_bytes`) must land every field
-    /// in its correct default state — verified directly rather than
-    /// trusted by construction.
+    /// `init`'s field writes (`accumulated_vote` filled via `write_bytes`,
+    /// the scalars written one by one) must land every field in its correct
+    /// default state — verified directly rather than trusted by construction.
+    ///
+    /// The destructuring below is deliberately exhaustive (no `..`): adding a
+    /// field to `VoteEngine` makes this test fail to *compile* until the new
+    /// field is both initialized and asserted here, instead of silently
+    /// leaving it unchecked. Never compare two engines byte-for-byte for this
+    /// purpose: padding bytes are uninitialized, and Miri rejects reading them.
     #[test]
-    fn init_in_place_sets_expected_defaults() {
-        let mut result = core::mem::MaybeUninit::<TestEngine>::uninit();
-        let engine = unsafe {
-            TestEngine::init_in_place(result.as_mut_ptr(), test_vote_scale(), TEST_VOTE_INTEREST);
-            result.assume_init()
-        };
+    fn init_sets_expected_defaults() {
+        let mut slot = core::mem::MaybeUninit::<TestEngine>::uninit();
+        let engine = TestEngine::init(&mut slot, test_vote_scale(), TEST_VOTE_INTEREST);
 
-        for i in 0..TEST_MAX_NODES {
-            assert_eq!(engine.accumulated_vote[i], 0);
-        }
-        assert_eq!(engine.vote_scale, test_vote_scale());
-        assert_eq!(engine.vote_interest, TEST_VOTE_INTEREST);
+        let VoteEngine {
+            accumulated_vote,
+            vote_scale,
+            vote_interest,
+            cap_threshold,
+        } = &*engine;
+
+        assert!(accumulated_vote.iter().all(|&v| v == 0));
+        assert_eq!(*vote_scale, test_vote_scale());
+        assert_eq!(*vote_interest, TEST_VOTE_INTEREST);
         assert_eq!(
-            engine.cap_threshold,
+            *cap_threshold,
             TestEngine::compute_cap_threshold(test_vote_scale(), TEST_VOTE_INTEREST)
         );
         // All-zero order is headed by node 0 (bootstrap rule).
         assert_eq!(engine.top_creator(), Some(0));
+    }
+
+    /// `init` must produce exactly what the by-value specification `new()`
+    /// produces. Both sides are destructured exhaustively (no `..`), so a new
+    /// field cannot slip past either the literal in `new()` or this
+    /// comparison. Never compare the two byte-for-byte: padding is
+    /// uninitialized, and Miri rejects reading it.
+    #[test]
+    fn init_is_equivalent_to_new() {
+        let mut slot = core::mem::MaybeUninit::<TestEngine>::uninit();
+        let built = TestEngine::init(&mut slot, test_vote_scale(), TEST_VOTE_INTEREST);
+        let spec = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+
+        let VoteEngine {
+            accumulated_vote,
+            vote_scale,
+            vote_interest,
+            cap_threshold,
+        } = &*built;
+        let VoteEngine {
+            accumulated_vote: spec_accumulated_vote,
+            vote_scale: spec_vote_scale,
+            vote_interest: spec_vote_interest,
+            cap_threshold: spec_cap_threshold,
+        } = &spec;
+
+        assert!(accumulated_vote == spec_accumulated_vote);
+        assert_eq!(vote_scale, spec_vote_scale);
+        assert_eq!(vote_interest, spec_vote_interest);
+        assert_eq!(cap_threshold, spec_cap_threshold);
+        assert!(*built == spec);
+    }
+
+    /// `reset` must leave a used engine indistinguishable from a freshly
+    /// `init`ed one with the same parameters.
+    #[test]
+    fn reset_restores_fresh_defaults() {
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.accumulated_vote[3] = 42;
+        engine.cap_threshold = 1;
+
+        engine.reset(test_vote_scale(), TEST_VOTE_INTEREST);
+
+        let fresh = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        let VoteEngine {
+            accumulated_vote,
+            vote_scale,
+            vote_interest,
+            cap_threshold,
+        } = &engine;
+        assert!(accumulated_vote.iter().all(|&v| v == 0));
+        assert_eq!(*vote_scale, fresh.vote_scale);
+        assert_eq!(*vote_interest, fresh.vote_interest);
+        assert_eq!(*cap_threshold, fresh.cap_threshold);
     }
 
     #[test]
