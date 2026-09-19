@@ -55,20 +55,44 @@ pub enum VoteEngineError {
     AccumulatedVoteUnderflow,
     /// The post-interest value is not reachable from the configured growth function.
     UnreachableInterestState,
+    /// The engine holds no FR37 parameters yet, so no vote effect can be
+    /// computed. A node has none until a chain configuration is loaded
+    /// (`moonblokz-blockchain` parameterizes the engine from the FR56
+    /// configuration handle); reading this error means a caller reached a vote
+    /// effect before that happened.
+    NotParameterized,
+}
+
+/// The FR37 parameters, held together because they are set together and are
+/// meaningless apart: `cap_threshold` is derived from the other two.
+///
+/// Bundled into one `Option` rather than three fields so that "parameterized"
+/// is a single state rather than an invariant spread over three values. The
+/// `NonZeroU16` gives `Option<VoteParams>` a niche, so the wrapper is free.
+#[derive(Clone, Copy)]
+#[cfg_attr(any(test, feature = "test-oracle"), derive(PartialEq, Eq))]
+struct VoteParams {
+    vote_scale: NonZeroU16,
+    vote_interest: u8,
+    // Smallest `av` for which `floor(av * vote_interest / vote_scale) >= vote_scale`.
+    // Above this point the interest bump is capped at `vote_scale`, so growth is linear.
+    cap_threshold: u32,
 }
 
 /// Per-node accumulated-vote registry (FR37 forward accumulation).
+///
+/// The engine is constructed **unparameterized**: the accumulated-vote array is
+/// meaningful on its own (all zero), while the FR37 parameters are chain
+/// configuration the node may not hold yet. Every vote effect therefore
+/// answers [`VoteEngineError::NotParameterized`] until [`Self::reset`] supplies
+/// them; the queries need no parameters and stay infallible.
 ///
 /// Const generic:
 /// - `MAX_NODES`: workspace node-roster capacity (architecture §5 default: 1000).
 #[cfg_attr(any(test, feature = "test-oracle"), derive(PartialEq, Eq))]
 pub struct VoteEngine<const MAX_NODES: usize> {
     accumulated_vote: [u32; MAX_NODES],
-    vote_scale: NonZeroU16,
-    vote_interest: u8,
-    // Smallest `av` for which `floor(av * vote_interest / vote_scale) >= vote_scale`.
-    // Above this point the interest bump is capped at `vote_scale`, so growth is linear.
-    cap_threshold: u32,
+    params: Option<VoteParams>,
 }
 
 impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
@@ -102,41 +126,12 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// uninitialized, which is a safe state (nothing is dropped). If `slot`
     /// already held an initialized value it is leaked rather than dropped;
     /// every field here is plain data, so that is a no-op.
-    pub fn init(
-        slot: &mut core::mem::MaybeUninit<Self>,
-        vote_scale: NonZeroU16,
-        vote_interest: u8,
-    ) -> &mut Self {
-        // SAFETY: `slot.as_mut_ptr()` is derived from a live `&mut
-        // MaybeUninit<Self>`, so it is non-null, aligned, valid for writes of
-        // `Self` and not aliased for the duration of this call.
-        unsafe { Self::write_fields(slot.as_mut_ptr(), vote_scale, vote_interest) };
-        // SAFETY: `write_fields` initialized every field of `Self`.
-        unsafe { slot.assume_init_mut() }
-    }
-
-    /// Re-parameterizes and empties a live engine in place (FR3 "not
-    /// resumable — clean working set on re-entry"): the same field writes as
-    /// [`Self::init`], applied over the existing value, so no `MAX_NODES`-
-    /// scaled temporary is ever materialized.
-    pub fn reset(&mut self, vote_scale: NonZeroU16, vote_interest: u8) {
-        // SAFETY: `self` is a live, exclusively borrowed `Self`, so the
-        // pointer is valid for writes. Every field is plain data with no
-        // `Drop`, so overwriting without dropping leaks nothing, and
-        // `write_fields` reads no prior value.
-        unsafe { Self::write_fields(self, vote_scale, vote_interest) };
-    }
-
-    /// The one invariant the type system cannot check for [`Self::init`]:
-    /// every field of `*p` is written, and none is read before its write.
-    /// Kept as the single body shared by [`Self::init`] and [`Self::reset`].
-    ///
-    /// # Safety
-    /// `p` must be non-null, aligned and valid for writes of `Self`. The
-    /// memory may be uninitialized; any previous contents are overwritten
-    /// without being dropped.
-    unsafe fn write_fields(p: *mut Self, vote_scale: NonZeroU16, vote_interest: u8) {
-        let cap_threshold = Self::compute_cap_threshold(vote_scale, vote_interest);
+    pub fn init(slot: &mut core::mem::MaybeUninit<Self>) -> &mut Self {
+        let p = slot.as_mut_ptr();
+        // SAFETY: `p` is derived from a live `&mut MaybeUninit<Self>`, so it is
+        // non-null, aligned, valid for writes of `Self` and not aliased for the
+        // duration of this call. Both fields are written below and neither is
+        // read before its write.
         unsafe {
             // All-zero `u32` array: `write_bytes` (memset) is correct (no
             // representation ambiguity for a primitive integer) and never
@@ -146,10 +141,48 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
             let accumulated_vote_ptr = (&raw mut (*p).accumulated_vote).cast::<u32>();
             accumulated_vote_ptr.write_bytes(0u8, MAX_NODES);
 
-            (&raw mut (*p).vote_scale).write(vote_scale);
-            (&raw mut (*p).vote_interest).write(vote_interest);
-            (&raw mut (*p).cap_threshold).write(cap_threshold);
+            // A real `None`, written as a value: `Option<VoteParams>` is
+            // niche-encoded, but that layout is not something `unsafe` code may
+            // assume, so the discriminant is never memset into place.
+            (&raw mut (*p).params).write(None);
         }
+        // SAFETY: every field of `Self` was written above.
+        unsafe { slot.assume_init_mut() }
+    }
+
+    /// Parameterizes and empties a live engine in place (FR3 "not resumable
+    /// — clean working set on re-entry"), and is the **only** way an engine
+    /// becomes usable: until it runs, every vote effect answers
+    /// [`VoteEngineError::NotParameterized`].
+    ///
+    /// No `MAX_NODES`-scaled temporary is materialized: the array is zeroed
+    /// where it already lives.
+    pub fn reset(&mut self, vote_scale: NonZeroU16, vote_interest: u8) {
+        self.clear();
+        self.params = Some(VoteParams {
+            vote_scale,
+            vote_interest,
+            cap_threshold: Self::compute_cap_threshold(vote_scale, vote_interest),
+        });
+    }
+
+    /// Empties the accumulated-vote state, leaving the FR37 parameters as they
+    /// are (or absent, if they never arrived).
+    ///
+    /// This is the FR3/FR5 "clean working set" step for the case where the
+    /// caller has no configuration to parameterize with — it must still be able
+    /// to guarantee that no partial projection survives.
+    pub fn clear(&mut self) {
+        // `fill` lowers to a memset over the array in place; it never
+        // materializes a `MAX_NODES`-scaled value the way an assignment from a
+        // literal would.
+        self.accumulated_vote.fill(0);
+    }
+
+    /// The FR37 parameters, or the refusal every vote effect returns without
+    /// them.
+    fn params(&self) -> Result<VoteParams, VoteEngineError> {
+        self.params.ok_or(VoteEngineError::NotParameterized)
     }
 
     /// The by-value constructor, kept as the **executable specification** of
@@ -162,22 +195,26 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// by value costs a `size_of::<Self>()`-sized transient, which is exactly
     /// what `init` exists to avoid on the embedded stack. Never a production
     /// code path.
+    // `Default` is deliberately not implemented: it would put a by-value
+    // constructor on the production surface, which is exactly what `init`
+    // exists to keep off it.
+    #[allow(clippy::new_without_default)]
     #[cfg(any(test, feature = "test-oracle"))]
-    pub fn new(vote_scale: NonZeroU16, vote_interest: u8) -> Self {
+    pub fn new() -> Self {
         Self {
             accumulated_vote: [0u32; MAX_NODES],
-            vote_scale,
-            vote_interest,
-            cap_threshold: Self::compute_cap_threshold(vote_scale, vote_interest),
+            params: None,
         }
     }
 
     /// Test-only stand-in that goes through the production path: runs
-    /// [`Self::init`] into a local slot and moves the finished value out.
+    /// [`Self::init`] into a local slot, parameterizes it, and moves the
+    /// finished value out.
     #[cfg(test)]
     fn new_for_test(vote_scale: NonZeroU16, vote_interest: u8) -> Self {
         let mut slot = core::mem::MaybeUninit::<Self>::uninit();
-        Self::init(&mut slot, vote_scale, vote_interest);
+        let engine = Self::init(&mut slot);
+        engine.reset(vote_scale, vote_interest);
         // SAFETY: `init` returned, so every field of `slot` is initialized.
         unsafe { slot.assume_init() }
     }
@@ -192,36 +229,33 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         ((scale * scale) + interest - 1) / interest
     }
 
-    fn vote_scale_u32(&self) -> u32 {
-        self.vote_scale.get() as u32
-    }
-
-    fn interest_bump_for(&self, av: u32) -> u32 {
-        if av == 0 || self.vote_interest == 0 {
+    fn interest_bump_for(p: VoteParams, av: u32) -> u32 {
+        if av == 0 || p.vote_interest == 0 {
             return 0;
         }
-        let scale = self.vote_scale_u32();
-        if av >= self.cap_threshold {
+        let scale = p.vote_scale.get() as u32;
+        if av >= p.cap_threshold {
             return scale;
         }
         // Safe below `cap_threshold`: `av * vote_interest < vote_scale^2`,
         // and `u16::MAX^2` fits in `u32`.
-        (av * self.vote_interest as u32) / scale
+        (av * p.vote_interest as u32) / scale
     }
 
-    fn apply_growth_to_value(&self, av: u32) -> Result<u32, VoteEngineError> {
-        av.checked_add(self.interest_bump_for(av))
+    fn apply_growth_to_value(p: VoteParams, av: u32) -> Result<u32, VoteEngineError> {
+        av.checked_add(Self::interest_bump_for(p, av))
             .ok_or(VoteEngineError::AccumulatedVoteOverflow)
     }
 
-    fn undo_growth_value(&self, after: u32) -> Result<u32, VoteEngineError> {
-        let scale = self.vote_scale_u32();
+    fn undo_growth_value(p: VoteParams, after: u32) -> Result<u32, VoteEngineError> {
+        let scale = p.vote_scale.get() as u32;
 
         // Fast path for the capped linear region: `after = before + vote_scale`.
-        if let Some(min_capped_after) = self.cap_threshold.checked_add(scale) {
+        if let Some(min_capped_after) = p.cap_threshold.checked_add(scale) {
             if after >= min_capped_after {
                 let before = after - scale;
-                if before >= self.cap_threshold && self.apply_growth_to_value(before) == Ok(after) {
+                if before >= p.cap_threshold && Self::apply_growth_to_value(p, before) == Ok(after)
+                {
                     return Ok(before);
                 }
             }
@@ -237,11 +271,11 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         // candidates. Saturating: degenerate configs
         // (`vote_interest > vote_scale`) can make `bump(after)` exceed a
         // small `after`.
-        let mut lo = after.saturating_sub(self.interest_bump_for(after));
-        let mut hi = after.saturating_sub(self.interest_bump_for(lo));
+        let mut lo = after.saturating_sub(Self::interest_bump_for(p, after));
+        let mut hi = after.saturating_sub(Self::interest_bump_for(p, lo));
         while lo <= hi {
             let mid = lo + (hi - lo) / 2;
-            match self.apply_growth_to_value(mid) {
+            match Self::apply_growth_to_value(p, mid) {
                 Ok(grown) => match grown.cmp(&after) {
                     Ordering::Equal => return Ok(mid),
                     Ordering::Less => {
@@ -276,13 +310,15 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// error instead of saturating if an accepted block would overflow the
     /// reversible `u32` accumulated-vote state.
     pub fn apply_block(&mut self, block: BlockView<'_>) -> Result<(), VoteEngineError> {
+        let params = self.params()?;
         let creator = block.creator();
-        let vote_scale = self.vote_scale_u32();
+        let vote_scale = params.vote_scale.get() as u32;
 
         // Preflight all interest and vote-credit additions before mutating so
         // arithmetic errors fail closed and do not leave partially-updated state.
         for node_id in 0..MAX_NODES {
-            let post_interest = self.apply_growth_to_value(self.accumulated_vote[node_id])?;
+            let post_interest =
+                Self::apply_growth_to_value(params, self.accumulated_vote[node_id])?;
             if let Some(payload) = block.transactions() {
                 let mut credit_count = 0u32;
                 for tx in payload.iter() {
@@ -311,7 +347,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         // === Step 1: anti-capture interest to every node, including creator ===
         for node_id in 0..MAX_NODES {
             self.accumulated_vote[node_id] =
-                self.apply_growth_to_value(self.accumulated_vote[node_id])?;
+                Self::apply_growth_to_value(params, self.accumulated_vote[node_id])?;
         }
 
         // === Step 2: vote credits from payload transactions ===
@@ -385,6 +421,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// [`apply_block`](Self::apply_block)), so an error leaves the
     /// accumulated-vote state unchanged.
     pub fn undo_block(&mut self, block: BlockView<'_>) -> Result<(), VoteEngineError> {
+        let params = self.params()?;
         let creator_idx = block.creator() as usize;
         // Ordinary blocks carry `consumed_votes_from_first_voted_node == 0`; only
         // deviation blocks record the penalized node's pre-penalty snapshot.
@@ -399,7 +436,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         // Preflight: compute every node's post-undo value without mutating, so
         // arithmetic errors fail closed and leave the state unchanged.
         for node_id in 0..MAX_NODES {
-            self.undo_value_for(node_id, &block, creator_idx, victim)?;
+            self.undo_value_for(params, node_id, &block, creator_idx, victim)?;
         }
 
         // Commit: repeat the identical per-node computation, now writing. Each
@@ -407,7 +444,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         // so in-place writes cannot influence later nodes.
         for node_id in 0..MAX_NODES {
             self.accumulated_vote[node_id] =
-                self.undo_value_for(node_id, &block, creator_idx, victim)?;
+                self.undo_value_for(params, node_id, &block, creator_idx, victim)?;
         }
         Ok(())
     }
@@ -425,6 +462,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// - Step 1 rollback: exact pre-image of the capped interest growth.
     fn undo_value_for(
         &self,
+        params: VoteParams,
         node_id: usize,
         block: &BlockView<'_>,
         creator_idx: usize,
@@ -445,13 +483,13 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
                 }
                 if tx.vote() as usize == node_id {
                     value = value
-                        .checked_sub(self.vote_scale_u32())
+                        .checked_sub(params.vote_scale.get() as u32)
                         .ok_or(VoteEngineError::AccumulatedVoteUnderflow)?;
                 }
             }
         }
 
-        self.undo_growth_value(value)
+        Self::undo_growth_value(params, value)
     }
 
     /// Seeds accumulated-vote state from a balance-block snapshot (FR50).
@@ -740,9 +778,10 @@ mod tests {
         NodeTransfer::new(vote, 0, 1, 0, 100, 1, 0, &sig)
     }
 
-    /// `init`'s field writes (`accumulated_vote` filled via `write_bytes`,
-    /// the scalars written one by one) must land every field in its correct
-    /// default state — verified directly rather than trusted by construction.
+    /// `init`'s field writes (`accumulated_vote` filled via `write_bytes`, the
+    /// parameters written as a real `None`) must land every field in its
+    /// correct default state — verified directly rather than trusted by
+    /// construction. The engine starts **unparameterized**.
     ///
     /// The destructuring below is deliberately exhaustive (no `..`): adding a
     /// field to `VoteEngine` makes this test fail to *compile* until the new
@@ -752,23 +791,17 @@ mod tests {
     #[test]
     fn init_sets_expected_defaults() {
         let mut slot = core::mem::MaybeUninit::<TestEngine>::uninit();
-        let engine = TestEngine::init(&mut slot, test_vote_scale(), TEST_VOTE_INTEREST);
+        let engine = TestEngine::init(&mut slot);
 
         let VoteEngine {
             accumulated_vote,
-            vote_scale,
-            vote_interest,
-            cap_threshold,
+            params,
         } = &*engine;
 
         assert!(accumulated_vote.iter().all(|&v| v == 0));
-        assert_eq!(*vote_scale, test_vote_scale());
-        assert_eq!(*vote_interest, TEST_VOTE_INTEREST);
-        assert_eq!(
-            *cap_threshold,
-            TestEngine::compute_cap_threshold(test_vote_scale(), TEST_VOTE_INTEREST)
-        );
-        // All-zero order is headed by node 0 (bootstrap rule).
+        assert!(params.is_none(), "a fresh engine holds no FR37 parameters");
+        // All-zero order is headed by node 0 (bootstrap rule) — the queries
+        // need no parameters.
         assert_eq!(engine.top_creator(), Some(0));
     }
 
@@ -780,26 +813,20 @@ mod tests {
     #[test]
     fn init_is_equivalent_to_new() {
         let mut slot = core::mem::MaybeUninit::<TestEngine>::uninit();
-        let built = TestEngine::init(&mut slot, test_vote_scale(), TEST_VOTE_INTEREST);
-        let spec = TestEngine::new(test_vote_scale(), TEST_VOTE_INTEREST);
+        let built = TestEngine::init(&mut slot);
+        let spec = TestEngine::new();
 
         let VoteEngine {
             accumulated_vote,
-            vote_scale,
-            vote_interest,
-            cap_threshold,
+            params,
         } = &*built;
         let VoteEngine {
             accumulated_vote: spec_accumulated_vote,
-            vote_scale: spec_vote_scale,
-            vote_interest: spec_vote_interest,
-            cap_threshold: spec_cap_threshold,
+            params: spec_params,
         } = &spec;
 
         assert!(accumulated_vote == spec_accumulated_vote);
-        assert_eq!(vote_scale, spec_vote_scale);
-        assert_eq!(vote_interest, spec_vote_interest);
-        assert_eq!(cap_threshold, spec_cap_threshold);
+        assert!(params == spec_params);
         assert!(*built == spec);
     }
 
@@ -809,21 +836,60 @@ mod tests {
     fn reset_restores_fresh_defaults() {
         let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.accumulated_vote[3] = 42;
-        engine.cap_threshold = 1;
 
         engine.reset(test_vote_scale(), TEST_VOTE_INTEREST);
 
         let fresh = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
         let VoteEngine {
             accumulated_vote,
-            vote_scale,
-            vote_interest,
-            cap_threshold,
+            params,
         } = &engine;
         assert!(accumulated_vote.iter().all(|&v| v == 0));
-        assert_eq!(*vote_scale, fresh.vote_scale);
-        assert_eq!(*vote_interest, fresh.vote_interest);
-        assert_eq!(*cap_threshold, fresh.cap_threshold);
+        assert!(params == &fresh.params);
+    }
+
+    /// Without FR37 parameters every vote effect refuses, and refuses without
+    /// touching the accumulated-vote state. The queries stay answerable.
+    #[test]
+    fn unparameterized_engine_refuses_vote_effects() {
+        let mut slot = core::mem::MaybeUninit::<TestEngine>::uninit();
+        let engine = TestEngine::init(&mut slot);
+        let crypto = test_crypto();
+        let mut buf_a = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let mut buf_b = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let mut buf_c = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+
+        assert_eq!(
+            engine.apply_block(make_empty_block(3, &mut buf_a, &crypto)),
+            Err(VoteEngineError::NotParameterized)
+        );
+        assert_eq!(
+            engine.undo_block(make_empty_block(3, &mut buf_b, &crypto)),
+            Err(VoteEngineError::NotParameterized)
+        );
+        assert!(engine.accumulated_vote.iter().all(|&v| v == 0));
+        assert_eq!(engine.top_creator(), Some(0));
+
+        // Parameterizing is the one transition that makes the engine usable.
+        engine.reset(test_vote_scale(), TEST_VOTE_INTEREST);
+        assert!(
+            engine
+                .apply_block(make_empty_block(3, &mut buf_c, &crypto))
+                .is_ok()
+        );
+    }
+
+    /// `clear` empties the working set without needing parameters — the FR3 /
+    /// FR5 "clean working set" step for a node that holds no configuration.
+    #[test]
+    fn clear_empties_without_parameters() {
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.accumulated_vote[2] = 7;
+
+        engine.clear();
+
+        assert!(engine.accumulated_vote.iter().all(|&v| v == 0));
+        assert!(engine.params.is_some(), "clear leaves the parameters alone");
     }
 
     #[test]
