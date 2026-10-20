@@ -37,9 +37,21 @@
 //!    Runs **last** so a creator voting for themselves in their own block
 //!    does not retain those votes.
 //!
-//! Deviation-block penalty: if the block's `consumed_votes_from_first_voted_node`
-//! header field is `> 0`, the `first_voted_node`'s accumulated vote is also
-//! reset (grace-period penalty per FR47, once per fallback cycle).
+//! Deviation-block penalty: a deviation block is one whose `first_voted_node`
+//! differs from its creator (FR45); the `first_voted_node`'s accumulated vote is
+//! also reset (grace-period penalty per FR47, once per fallback cycle).
+//!
+//! ## Header snapshots (FR37, Story 6.2 D5 / DEC-156)
+//!
+//! A block's `consumed_votes` is its creator's accumulated vote after step 1
+//! and **before** step 2, and a deviation block's
+//! `consumed_votes_from_first_voted_node` is the first-voted node's value at the
+//! same point. A block's own credits therefore never enter its value, while
+//! step 3 still wipes the credits a block gives its own creator. Because the
+//! first-voted node leads the creator order (FR38) and interest is monotone, a
+//! deviation block is never valued above the normal block it replaces.
+//! [`VoteEngine::check_header`] verifies the snapshots (I-09, FR9 Tier 3), and
+//! [`VoteEngine::undo_block`] restores both nodes from them.
 
 use core::cmp::Ordering;
 use core::num::NonZeroU16;
@@ -379,23 +391,12 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         }
 
         // === Deviation-block penalty (FR47) ===
-        // Ordinary blocks have `consumed_votes_from_first_voted_node == 0`.
-        // Deviation blocks carry a non-zero value indicating the grace-period
-        // penalty against the originally-top node.
-        let consumed_from_first_voted_node = block.consumed_votes_from_first_voted_node();
-        if consumed_from_first_voted_node > 0 {
-            let victim = block.first_voted_node() as usize;
-            if victim < MAX_NODES {
-                if self.accumulated_vote[victim] != consumed_from_first_voted_node {
-                    // Story 11.2 / FR64 logging hook: emit a structured warning here.
-                    // A deviation block's `consumed_votes_from_first_voted_node`
-                    // should match the first-voted node's post-interest,
-                    // post-credit, pre-penalty accumulated vote at this point.
-                    // For Story 3.1 we keep the defensive behavior unchanged and
-                    // still apply the penalty reset below.
-                }
-                self.accumulated_vote[victim] = 0;
-            }
+        // A deviation block names a first-voted node other than its creator
+        // (FR45). Its snapshot is verified by `check_header` before the apply;
+        // the penalty resets the node whatever credits this block gave it.
+        let victim = block.first_voted_node();
+        if victim != creator && (victim as usize) < MAX_NODES {
+            self.accumulated_vote[victim as usize] = 0;
         }
 
         Ok(())
@@ -407,10 +408,16 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// reset → vote credits → anti-capture interest) using the two pre-reset
     /// snapshots stored in the block header:
     ///
-    /// - `block.consumed_votes()` — creator's post-interest, post-credit value
-    ///   (the pre-reset snapshot captured by the block author per epics.md §Story 3.1).
-    /// - `block.consumed_votes_from_first_voted_node()` — the penalized node's
-    ///   pre-penalty value (zero for ordinary blocks, non-zero for deviation blocks).
+    /// - `block.consumed_votes()` — the creator's post-interest, pre-credit value
+    ///   (FR37, DEC-156).
+    /// - `block.consumed_votes_from_first_voted_node()` — for a deviation block
+    ///   (`first_voted_node != creator`), the penalized node's post-interest,
+    ///   pre-credit value.
+    ///
+    /// Both snapshots precede the block's credits, and the reset or penalty wiped
+    /// those credits, so neither node gets a credit subtraction: each is restored
+    /// as the interest pre-image of its snapshot. The headers must be true
+    /// ([`Self::check_header`]); the blockchain verifies them before applying.
     ///
     /// Interest rollback uses an exact monotonic inverse search for the configured
     /// capped growth function. If a post-interest value is not reachable, the method
@@ -423,15 +430,11 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     pub fn undo_block(&mut self, block: BlockView<'_>) -> Result<(), VoteEngineError> {
         let params = self.params()?;
         let creator_idx = block.creator() as usize;
-        // Ordinary blocks carry `consumed_votes_from_first_voted_node == 0`; only
-        // deviation blocks record the penalized node's pre-penalty snapshot.
-        let consumed_from_first = block.consumed_votes_from_first_voted_node();
-        let victim = if consumed_from_first > 0 {
-            let victim_idx = block.first_voted_node() as usize;
-            (victim_idx < MAX_NODES).then_some((victim_idx, consumed_from_first))
-        } else {
-            None
-        };
+        // Only a deviation block (`first_voted_node != creator`, FR45) penalized
+        // a second node and recorded its snapshot.
+        let first_voted = block.first_voted_node() as usize;
+        let victim = (first_voted != creator_idx && first_voted < MAX_NODES)
+            .then_some((first_voted, block.consumed_votes_from_first_voted_node()));
 
         // Preflight: compute every node's post-undo value without mutating, so
         // arithmetic errors fail closed and leave the state unchanged.
@@ -453,12 +456,12 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// and the block header/payload, without mutating anything. Reverses the
     /// FR37 steps for that node in reverse order:
     ///
-    /// - Step 4/3 rollback (base selection): the creator slot restores from
-    ///   `consumed_votes`, the deviation victim from
-    ///   `consumed_votes_from_first_voted_node`. Step 3 ran after step 4
-    ///   forward, so the creator snapshot wins when both name the same node.
-    /// - Step 2 rollback: subtract one `vote_scale` per credit the block's
-    ///   payload gave this node (FR51 zero-input carry-forward skip mirrored).
+    /// - Creator and deviation victim: the slot restores from its pre-credit
+    ///   snapshot (`consumed_votes` / `consumed_votes_from_first_voted_node`),
+    ///   with no credit subtraction — the reset or penalty wiped the credits.
+    /// - Every other node — step 2 rollback: subtract one `vote_scale` per
+    ///   credit the block's payload gave it (FR51 zero-input carry-forward skip
+    ///   mirrored).
     /// - Step 1 rollback: exact pre-image of the capped interest growth.
     fn undo_value_for(
         &self,
@@ -468,12 +471,16 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         creator_idx: usize,
         victim: Option<(usize, u32)>,
     ) -> Result<u32, VoteEngineError> {
-        let mut value = match victim {
-            _ if node_id == creator_idx => block.consumed_votes(),
-            Some((victim_idx, consumed)) if victim_idx == node_id => consumed,
-            _ => self.accumulated_vote[node_id],
+        let snapshot = match victim {
+            _ if node_id == creator_idx => Some(block.consumed_votes()),
+            Some((victim_idx, consumed)) if victim_idx == node_id => Some(consumed),
+            _ => None,
         };
+        if let Some(pre_credit) = snapshot {
+            return Self::undo_growth_value(params, pre_credit);
+        }
 
+        let mut value = self.accumulated_vote[node_id];
         if let Some(payload) = block.transactions() {
             for tx in payload.iter() {
                 if let Some(complex) = tx.as_complex() {
@@ -490,6 +497,51 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         }
 
         Self::undo_growth_value(params, value)
+    }
+
+    /// Checks a block's vote header fields against the current (parent) state:
+    /// FR9 Tier 3 invariant I-09 (FR37, FR45; Story 6.2 D5, DEC-156). Read-only,
+    /// and it reads no payload.
+    ///
+    /// - The creator's `consumed_votes` equals its post-interest, pre-credit value.
+    /// - A normal block (`first_voted_node == creator`) carries
+    ///   `consumed_votes_from_first_voted_node == 0`.
+    /// - A deviation block names the creator-order top (FR38) and carries that
+    ///   node's post-interest, pre-credit value.
+    ///
+    /// Each value is checked only where the state is authoritative. In a
+    /// `complete` projection everything is checked. Otherwise, a node's own
+    /// value is checked once `is_seeded` holds for it, and the top identity is
+    /// not checked, because a partial seeding cannot tell who leads.
+    ///
+    /// Returns `Ok(false)` on a mismatch (exact evidence for the caller), and
+    /// `Err` only for [`VoteEngineError::NotParameterized`] or an interest
+    /// overflow.
+    pub fn check_header(
+        &self,
+        block: &BlockView<'_>,
+        complete: bool,
+        is_seeded: impl Fn(u32) -> bool,
+    ) -> Result<bool, VoteEngineError> {
+        let params = self.params()?;
+        let snapshot =
+            |node: u32| Self::apply_growth_to_value(params, self.accumulated_vote_of(node));
+        let creator = block.creator();
+        if (complete || is_seeded(creator)) && block.consumed_votes() != snapshot(creator)? {
+            return Ok(false);
+        }
+        let first_voted = block.first_voted_node();
+        let recorded = block.consumed_votes_from_first_voted_node();
+        if first_voted == creator {
+            return Ok(recorded == 0);
+        }
+        if complete && self.top_creator() != Some(first_voted) {
+            return Ok(false);
+        }
+        if (complete || is_seeded(first_voted)) && recorded != snapshot(first_voted)? {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Seeds accumulated-vote state from a balance-block snapshot (FR50).
@@ -725,7 +777,7 @@ mod tests {
         buffer: &'a mut [u8; moonblokz_chain_types::MAX_BLOCK_SIZE],
         crypto: &Crypto,
     ) -> BlockView<'a> {
-        make_block_view(creator, 0, 0, 0, None, buffer, crypto)
+        make_block_view(creator, 0, creator, 0, None, buffer, crypto)
     }
 
     /// Builds a balance-block `BlockView<'a>` containing the given node-info
@@ -963,7 +1015,7 @@ mod tests {
         let crypto = test_crypto();
         let nt = nt_with_vote(5);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
-        let block = make_block_view(3, 0, 0, 0, Some(nt.as_bytes()), &mut buf, &crypto);
+        let block = make_block_view(3, 0, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
 
         engine.apply_block(block).expect("apply block must succeed");
 
@@ -977,7 +1029,7 @@ mod tests {
         let crypto = test_crypto();
         let nt = nt_with_vote(0);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
-        let block = make_block_view(3, 0, 0, 0, Some(nt.as_bytes()), &mut buf, &crypto);
+        let block = make_block_view(3, 0, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
 
         engine.apply_block(block).expect("apply block must succeed");
 
@@ -992,7 +1044,7 @@ mod tests {
         let crypto = test_crypto();
         let complex = ComplexTransaction::new(7);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
-        let block = make_block_view(3, 0, 0, 0, Some(complex.as_bytes()), &mut buf, &crypto);
+        let block = make_block_view(3, 0, 3, 0, Some(complex.as_bytes()), &mut buf, &crypto);
 
         engine.apply_block(block).expect("apply block must succeed");
 
@@ -1020,7 +1072,7 @@ mod tests {
         let crypto = test_crypto();
         let nt = nt_with_vote(3);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
-        let block = make_block_view(3, 0, 0, 0, Some(nt.as_bytes()), &mut buf, &crypto);
+        let block = make_block_view(3, 0, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
 
         engine.apply_block(block).expect("apply block must succeed");
 
@@ -1045,14 +1097,14 @@ mod tests {
 
     #[test]
     fn apply_block_ordinary_block_no_deviation_penalty() {
-        // Ordinary block: `consumed_votes_from_first_voted_node == 0` — no
-        // deviation reset. Node 4 gets the interest bump instead.
+        // Ordinary block: `first_voted_node == creator` — no deviation reset.
+        // Node 4 gets the interest bump instead.
         let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(4, 4000);
 
         let crypto = test_crypto();
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
-        let block = make_block_view(5, 0, 0, 0, None, &mut buf, &crypto);
+        let block = make_block_view(5, 0, 5, 0, None, &mut buf, &crypto);
 
         engine.apply_block(block).expect("apply block must succeed");
 
@@ -1069,14 +1121,14 @@ mod tests {
 
             let mut buf1 = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
             let nt1 = nt_with_vote(5);
-            let block1 = make_block_view(3, 0, 0, 0, Some(nt1.as_bytes()), &mut buf1, &crypto);
+            let block1 = make_block_view(3, 0, 3, 0, Some(nt1.as_bytes()), &mut buf1, &crypto);
             engine
                 .apply_block(block1)
                 .expect("apply block must succeed");
 
             let mut buf2 = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
             let nt2 = nt_with_vote(5);
-            let block2 = make_block_view(7, 0, 0, 0, Some(nt2.as_bytes()), &mut buf2, &crypto);
+            let block2 = make_block_view(7, 0, 7, 0, Some(nt2.as_bytes()), &mut buf2, &crypto);
             engine
                 .apply_block(block2)
                 .expect("apply block must succeed");
@@ -1109,7 +1161,7 @@ mod tests {
 
         let crypto = test_crypto();
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
-        let block = make_block_view(3, 2100, 0, 0, None, &mut buf, &crypto);
+        let block = make_block_view(3, 2100, 3, 0, None, &mut buf, &crypto);
 
         engine.apply_block(block).expect("apply block must succeed");
         assert_eq!(engine.accumulated_vote[3], 0);
@@ -1133,7 +1185,7 @@ mod tests {
         let crypto = test_crypto();
         let nt = nt_with_vote(5);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
-        let block = make_block_view(3, 0, 0, 0, Some(nt.as_bytes()), &mut buf, &crypto);
+        let block = make_block_view(3, 0, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
 
         engine.apply_block(block).expect("apply block must succeed");
         assert_eq!(engine.accumulated_vote[5], TEST_VOTE_SCALE);
@@ -1326,7 +1378,7 @@ mod tests {
         let crypto = test_crypto();
         let nt = nt_with_vote(5);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
-        let block = make_block_view(3, 0, 0, 0, Some(nt.as_bytes()), &mut buf, &crypto);
+        let block = make_block_view(3, 0, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
 
         let result = engine.undo_block(block);
 
@@ -1340,11 +1392,10 @@ mod tests {
     #[test]
     fn undo_reverses_deviation_penalty() {
         // Deviation block: creator = 5, first_voted_node = 3.
-        // Pre-apply av[3] = 4000. Forward step 1 bumps to 4200 before step 4 wipes; that is the value
-        // recorded in `consumed_votes_from_first_voted_node` per the forward
-        // apply_block comment ("post-interest, post-credit, pre-penalty").
-        // Undo restores av[3] = 4200 (step 4 rollback), then step 1 reverse
-        // pulls it back to 4000.
+        // Pre-apply av[3] = 4000. Forward step 1 bumps it to 4200, the
+        // post-interest, pre-credit snapshot recorded in
+        // `consumed_votes_from_first_voted_node` (DEC-156), before the penalty
+        // wipes it. Undo takes the interest pre-image of the snapshot: 4000.
         let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
         engine.set_accumulated_vote_for_test(3, 4000);
 
@@ -1578,7 +1629,7 @@ mod tests {
         // recompute back to 3.
         let crypto = test_crypto();
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
-        let block = make_block_view(3, 2100, 0, 0, None, &mut buf, &crypto);
+        let block = make_block_view(3, 2100, 3, 0, None, &mut buf, &crypto);
         engine.apply_block(block).expect("apply block must succeed");
         // After apply: av[3] = 0, av[7] = 105 → top = 7.
         assert_eq!(engine.top_creator(), Some(7));
@@ -1771,5 +1822,200 @@ mod tests {
                 );
             }
         }
+    }
+    // ==================================================================
+    // Story 6.2 — pre-credit header snapshots, `check_header` (I-09)
+    // ==================================================================
+
+    /// Deviation block: creator 5 credited by its own transaction, first-voted
+    /// node 3 credited too; both snapshots are pre-credit.
+    fn deviation_with_credits<'a>(
+        buf: &'a mut [u8; moonblokz_chain_types::MAX_BLOCK_SIZE],
+        crypto: &Crypto,
+        consumed: u32,
+        recorded: u32,
+    ) -> BlockView<'a> {
+        let nt_self = nt_with_vote(5);
+        let nt_victim = nt_with_vote(3);
+        let header = BlockHeader {
+            version: 1,
+            sequence: 0,
+            creator: 5,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_TRANSACTION,
+            consumed_votes: consumed,
+            first_voted_node: 3,
+            consumed_votes_from_first_voted_node: recorded,
+            previous_hash: [0u8; 32],
+            signature: [0u8; 64],
+        };
+        let mut builder = BlockBuilder::new().header(header);
+        for nt in [&nt_self, &nt_victim] {
+            builder
+                .add_transaction_bytes(nt.as_bytes())
+                .ok()
+                .expect("test tx must fit in the block payload");
+        }
+        let block = builder
+            .build_signed(crypto)
+            .ok()
+            .expect("test block must build with the fixture crypto handle");
+        let serialized = block.serialized_bytes();
+        buf[..serialized.len()].copy_from_slice(serialized);
+        BlockView::from_bytes(&buf[..serialized.len()])
+            .ok()
+            .expect("just-built block must parse as BlockView")
+    }
+
+    #[test]
+    fn deviation_credits_are_wiped_and_undo_restores_from_snapshots() {
+        // av[3] = 4000 (top), av[5] = 2000. Snapshots: I(2000) = 2100,
+        // I(4000) = 4200. Both nodes also receive a credit in the block, which
+        // the reset and the penalty wipe; undo restores both exactly.
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(3, 4000);
+        engine.set_accumulated_vote_for_test(5, 2000);
+        engine.set_accumulated_vote_for_test(7, 300);
+        let pre_state = engine.accumulated_vote;
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = deviation_with_credits(&mut buf, &crypto, 2100, 4200);
+        assert_eq!(engine.check_header(&block, true, |_| true), Ok(true));
+
+        engine.apply_block(block).expect("apply block must succeed");
+        assert_eq!(engine.accumulated_vote[5], 0);
+        assert_eq!(engine.accumulated_vote[3], 0);
+
+        let block_for_undo = BlockView::from_bytes(&buf[..])
+            .ok()
+            .expect("buffer must still parse for undo");
+        engine
+            .undo_block(block_for_undo)
+            .expect("undo block must succeed");
+        assert_eq!(engine.accumulated_vote, pre_state);
+    }
+
+    #[test]
+    fn penalty_applies_when_the_first_voted_node_holds_no_vote() {
+        // The first-voted node starts at 0, so its snapshot is 0, but the
+        // block credits it: the penalty must still wipe that credit, and undo
+        // must restore 0.
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = deviation_with_credits(&mut buf, &crypto, 0, 0);
+        engine.apply_block(block).expect("apply block must succeed");
+        assert_eq!(engine.accumulated_vote[3], 0);
+
+        let block_for_undo = BlockView::from_bytes(&buf[..])
+            .ok()
+            .expect("buffer must still parse for undo");
+        engine
+            .undo_block(block_for_undo)
+            .expect("undo block must succeed");
+        assert_eq!(engine.accumulated_vote[3], 0);
+        assert_eq!(engine.accumulated_vote[5], 0);
+    }
+
+    #[test]
+    fn creator_self_credit_round_trips_through_undo() {
+        // A normal block whose own transaction credits its creator: the reset
+        // wipes the credit; undo must not subtract it from the snapshot.
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(3, 2000);
+        let crypto = test_crypto();
+        let nt = nt_with_vote(3);
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_block_view(3, 2100, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
+        assert_eq!(engine.check_header(&block, true, |_| true), Ok(true));
+        engine.apply_block(block).expect("apply block must succeed");
+        assert_eq!(engine.accumulated_vote[3], 0);
+
+        let block_for_undo = BlockView::from_bytes(&buf[..])
+            .ok()
+            .expect("buffer must still parse for undo");
+        engine
+            .undo_block(block_for_undo)
+            .expect("undo block must succeed");
+        assert_eq!(engine.accumulated_vote[3], 2000);
+    }
+
+    #[test]
+    fn check_header_rejects_each_inconsistent_field() {
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(3, 4000);
+        engine.set_accumulated_vote_for_test(5, 2000);
+        let crypto = test_crypto();
+        let all = |_| true;
+
+        // Normal block: wrong value; own credits counted (old definition);
+        // non-zero deviation field.
+        let nt = nt_with_vote(3);
+        for (consumed, recorded) in [(2000, 0), (5200, 0), (4200, 1)] {
+            let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+            let block = make_block_view(
+                3,
+                consumed,
+                3,
+                recorded,
+                Some(nt.as_bytes()),
+                &mut buf,
+                &crypto,
+            );
+            assert_eq!(
+                engine.check_header(&block, true, all),
+                Ok(false),
+                "{consumed}/{recorded}"
+            );
+        }
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_block_view(3, 4200, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
+        assert_eq!(engine.check_header(&block, true, all), Ok(true));
+
+        // Deviation block: the creator's own credit counted (AR-005); a wrong
+        // first-voted snapshot; a first-voted node that is not the top.
+        for (consumed, recorded) in [(3100, 4200), (2100, 5200)] {
+            let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+            let block = deviation_with_credits(&mut buf, &crypto, consumed, recorded);
+            assert_eq!(
+                engine.check_header(&block, true, all),
+                Ok(false),
+                "{consumed}/{recorded}"
+            );
+        }
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_block_view(7, 0, 5, 2100, None, &mut buf, &crypto);
+        assert_eq!(engine.check_header(&block, true, all), Ok(false));
+        // ... which a partial projection cannot judge: only seeded values count.
+        assert_eq!(engine.check_header(&block, false, |n| n == 5), Ok(true));
+        assert_eq!(engine.check_header(&block, false, |_| false), Ok(true));
+    }
+
+    #[test]
+    fn check_header_skips_unseeded_values_in_a_partial_projection() {
+        // A window-anchored pass: the creator is unseeded, so its value is not
+        // judged; the normal form still is.
+        let engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_block_view(4, 9999, 4, 0, None, &mut buf, &crypto);
+        assert_eq!(engine.check_header(&block, false, |_| false), Ok(true));
+        assert_eq!(engine.check_header(&block, true, |_| false), Ok(false));
+        let mut buf2 = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block2 = make_block_view(4, 9999, 4, 1, None, &mut buf2, &crypto);
+        assert_eq!(engine.check_header(&block2, false, |_| false), Ok(false));
+    }
+
+    #[test]
+    fn check_header_requires_parameters() {
+        let mut slot = core::mem::MaybeUninit::<TestEngine>::uninit();
+        let engine = TestEngine::init(&mut slot);
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_empty_block(3, &mut buf, &crypto);
+        assert_eq!(
+            engine.check_header(&block, true, |_| true),
+            Err(VoteEngineError::NotParameterized)
+        );
     }
 }
