@@ -238,7 +238,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         let scale = vote_scale.get() as u32;
         let interest = vote_interest as u32;
         // `u16::MAX * u16::MAX + u8::MAX` still fits in `u32`.
-        ((scale * scale) + interest - 1) / interest
+        (scale * scale).div_ceil(interest)
     }
 
     fn interest_bump_for(p: VoteParams, av: u32) -> u32 {
@@ -263,13 +263,12 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         let scale = p.vote_scale.get() as u32;
 
         // Fast path for the capped linear region: `after = before + vote_scale`.
-        if let Some(min_capped_after) = p.cap_threshold.checked_add(scale) {
-            if after >= min_capped_after {
-                let before = after - scale;
-                if before >= p.cap_threshold && Self::apply_growth_to_value(p, before) == Ok(after)
-                {
-                    return Ok(before);
-                }
+        if let Some(min_capped_after) = p.cap_threshold.checked_add(scale)
+            && after >= min_capped_after
+        {
+            let before = after - scale;
+            if before >= p.cap_threshold && Self::apply_growth_to_value(p, before) == Ok(after) {
+                return Ok(before);
             }
         }
 
@@ -334,10 +333,10 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
             if let Some(payload) = block.transactions() {
                 let mut credit_count = 0u32;
                 for tx in payload.iter() {
-                    if let Some(complex) = tx.as_complex() {
-                        if complex.input_count() == 0 {
-                            continue;
-                        }
+                    if let Some(complex) = tx.as_complex()
+                        && complex.input_count() == 0
+                    {
+                        continue;
                     }
                     if tx.vote() as usize == node_id {
                         credit_count = credit_count
@@ -367,10 +366,10 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
             for tx in payload.iter() {
                 // FR51 replay-safety: zero-input UTXO carry-forward
                 // contributes no vote credit.
-                if let Some(complex) = tx.as_complex() {
-                    if complex.input_count() == 0 {
-                        continue;
-                    }
+                if let Some(complex) = tx.as_complex()
+                    && complex.input_count() == 0
+                {
+                    continue;
                 }
                 let target = tx.vote() as usize;
                 if target >= MAX_NODES {
@@ -483,10 +482,10 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         let mut value = self.accumulated_vote[node_id];
         if let Some(payload) = block.transactions() {
             for tx in payload.iter() {
-                if let Some(complex) = tx.as_complex() {
-                    if complex.input_count() == 0 {
-                        continue;
-                    }
+                if let Some(complex) = tx.as_complex()
+                    && complex.input_count() == 0
+                {
+                    continue;
                 }
                 if tx.vote() as usize == node_id {
                     value = value
@@ -512,7 +511,10 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// Each value is checked only where the state is authoritative. In a
     /// `complete` projection everything is checked. Otherwise, a node's own
     /// value is checked once `is_seeded` holds for it, and the top identity is
-    /// not checked, because a partial seeding cannot tell who leads.
+    /// not checked, because a partial seeding cannot tell who leads. The normal
+    /// form (`consumed_votes_from_first_voted_node == 0` when the creator is the
+    /// first-voted node) reads no state, so it is checked in every case; it is
+    /// also the blockchain's FR9 Tier 1 header form.
     ///
     /// Returns `Ok(false)` on a mismatch (exact evidence for the caller), and
     /// `Err` only for [`VoteEngineError::NotParameterized`] or an interest
@@ -642,10 +644,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
                     _ => {}
                 }
             }
-            if best.is_none() {
-                // `rank >= MAX_NODES` — the total order is exhausted.
-                return None;
-            }
+            best?;
             cursor = best;
         }
         cursor.map(|(_, node_id)| node_id)
@@ -1333,7 +1332,7 @@ mod tests {
 
         let crypto = test_crypto();
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
-        let block = make_empty_block(4, &mut buf, &crypto);
+        make_empty_block(4, &mut buf, &crypto);
         let block_for_undo = BlockView::from_bytes(&buf[..])
             .ok()
             .expect("buffer must still parse for undo");
@@ -2004,6 +2003,23 @@ mod tests {
         let mut buf2 = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block2 = make_block_view(4, 9999, 4, 1, None, &mut buf2, &crypto);
         assert_eq!(engine.check_header(&block2, false, |_| false), Ok(false));
+    }
+
+    #[test]
+    fn check_header_reports_interest_overflow_only_where_it_judges() {
+        // The creator's interest step overflows: an error where the value is
+        // judged, and no evaluation at all for an unseeded node in a partial
+        // projection (the `&&` short-circuits before the snapshot).
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(3, u32::MAX - 10);
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_block_view(3, 0, 3, 0, None, &mut buf, &crypto);
+        assert_eq!(
+            engine.check_header(&block, true, |_| true),
+            Err(VoteEngineError::AccumulatedVoteOverflow)
+        );
+        assert_eq!(engine.check_header(&block, false, |_| false), Ok(true));
     }
 
     #[test]
