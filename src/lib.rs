@@ -549,8 +549,9 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     /// Seeds accumulated-vote state from a balance-block snapshot (FR50).
     ///
     /// Each `NodeInfoView` entry sets `accumulated_vote[owner] = vote_count`.
-    /// Un-listed nodes are left untouched — Story 6.3 chain-switch replay
-    /// re-forwards interest on top of the seeded baseline.
+    /// Un-listed nodes are left untouched. Seeding has no inverse: only the FR3
+    /// pass seeds, and the blockchain's chain switch never walks back across a
+    /// seeding block (Story 6.3 D2, DEC-167).
     ///
     /// If `block` is not a balance block (payload type != 2), this is a
     /// defensive no-op. Owner ids outside `MAX_NODES` are silently skipped.
