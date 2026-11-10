@@ -24,7 +24,9 @@ test-oracle = []
 # The crypto backend is forwarded to `moonblokz-chain-types` (which forwards it
 # on to `moonblokz-crypto`). Exactly one must be active; the default is the
 # embedded-oriented crypto-bigint backend.
-default = ["schnorr-crypto-bigint"]
+default = ["schnorr-crypto-bigint", "block-size-2016"]
+block-size-2016 = ["moonblokz-chain-types/block-size-2016"]
+block-size-65536 = ["moonblokz-chain-types/block-size-65536"]
 schnorr-crypto-bigint = ["moonblokz-chain-types/schnorr-crypto-bigint"]
 schnorr-malachite = ["moonblokz-chain-types/schnorr-malachite"]
 schnorr-num-bigint-dig = ["moonblokz-chain-types/schnorr-num-bigint-dig"]
