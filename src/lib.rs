@@ -722,13 +722,13 @@ mod tests {
         NonZeroU16::new(TEST_VOTE_SCALE as u16).expect("test vote scale must be non-zero")
     }
 
-    /// Constructs a real Schnorr (crypto-bigint) `Crypto` instance for
+    /// Constructs a real Schnorr (BIP-340) `Crypto` instance for
     /// signing test-fixture blocks.
     fn test_crypto() -> Crypto {
         let private_key = [1u8; PRIVATE_KEY_SIZE];
         Crypto::new(private_key)
             .ok()
-            .expect("test private key must be accepted by the crypto-bigint Schnorr backend")
+            .expect("test private key must be accepted by the Schnorr backend")
     }
 
     /// Builds a `BlockView<'a>` from the given creator + header fields +

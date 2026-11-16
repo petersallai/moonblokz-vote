@@ -22,17 +22,19 @@ moonblokz-chain-types = { path = "../moonblokz-chain-types", default-features = 
 # crates turn it on from their `[dev-dependencies]` only.
 test-oracle = []
 # The crypto backend is forwarded to `moonblokz-chain-types` (which forwards it
-# on to `moonblokz-crypto`). Exactly one must be active; the default is the
-# embedded-oriented crypto-bigint backend.
-default = ["schnorr-crypto-bigint", "block-size-2016"]
+# on to `moonblokz-crypto`). Exactly one signature scheme must be active
+# (DEC-246); the default is `schnorr`.
+default = ["schnorr", "block-size-2016"]
 block-size-2016 = ["moonblokz-chain-types/block-size-2016"]
 block-size-65536 = ["moonblokz-chain-types/block-size-65536"]
-schnorr-crypto-bigint = ["moonblokz-chain-types/schnorr-crypto-bigint"]
-schnorr-malachite = ["moonblokz-chain-types/schnorr-malachite"]
-schnorr-num-bigint-dig = ["moonblokz-chain-types/schnorr-num-bigint-dig"]
+schnorr = ["moonblokz-chain-types/schnorr"]
+bls-min-sig = ["moonblokz-chain-types/bls-min-sig"]
+bls-min-pk = ["moonblokz-chain-types/bls-min-pk"]
 
 # Test-only: needed to sign `BlockBuilder::build_signed(...)` fixtures.
 # Not linked into production builds — leaf-crate discipline holds on the
 # `[dependencies]` set above.
 [dev-dependencies]
-moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false, features = ["schnorr-crypto-bigint"] }
+# No scheme is pinned here: the crate's own scheme feature selects it through
+# chain-types, so a matrix leg never enables two schemes.
+moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false }
