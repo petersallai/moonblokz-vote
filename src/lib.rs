@@ -710,6 +710,7 @@ mod tests {
         PAYLOAD_TYPE_TRANSACTION,
     };
     use moonblokz_crypto::{Crypto, CryptoTrait, PRIVATE_KEY_SIZE};
+    use moonblokz_crypto::{PUBLIC_KEY_SIZE, SIGNATURE_SIZE};
 
     // Test instance parameters.
     const TEST_MAX_NODES: usize = 16;
@@ -753,7 +754,7 @@ mod tests {
             first_voted_node,
             consumed_votes_from_first_voted_node,
             previous_hash: [0u8; 32],
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         if let Some(bytes) = tx_bytes {
@@ -800,7 +801,7 @@ mod tests {
             first_voted_node: 0,
             consumed_votes_from_first_voted_node: 0,
             previous_hash: [0u8; 32],
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         for ni in entries {
@@ -827,7 +828,7 @@ mod tests {
 
     /// Node-transfer tx with `vote_target = vote`, `initializer = 1`.
     fn nt_with_vote(vote: u32) -> NodeTransfer {
-        let sig = [0xAA; 64];
+        let sig = [0xAA; SIGNATURE_SIZE];
         NodeTransfer::new(vote, 0, 1, 0, 100, 1, 0, &sig)
     }
 
@@ -1479,7 +1480,7 @@ mod tests {
     fn seed_from_balance_block_populates_snapshots() {
         let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
         let crypto = test_crypto();
-        let pk = [0xBBu8; 32];
+        let pk = [0xBBu8; PUBLIC_KEY_SIZE];
         let entries = [
             NodeInfo::new(5, 0, 2000, &pk),
             NodeInfo::new(7, 0, 5000, &pk),
@@ -1528,7 +1529,7 @@ mod tests {
         engine.set_accumulated_vote_for_test(2, 4000);
 
         let crypto = test_crypto();
-        let pk = [0xBBu8; 32];
+        let pk = [0xBBu8; PUBLIC_KEY_SIZE];
         let entries = [
             NodeInfo::new(TEST_MAX_NODES as u32, 0, 9999, &pk),
             NodeInfo::new(u32::MAX, 0, 42, &pk),
@@ -1655,7 +1656,7 @@ mod tests {
         // Seed a balance block that reseeds node 5 with a much larger vote —
         // top should reflect node 5 afterwards.
         let crypto = test_crypto();
-        let pk = [0xBBu8; 32];
+        let pk = [0xBBu8; PUBLIC_KEY_SIZE];
         let entries = [NodeInfo::new(5, 0, 9999, &pk)];
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_balance_block(&entries, &mut buf, &crypto);
@@ -1848,7 +1849,7 @@ mod tests {
             first_voted_node: 3,
             consumed_votes_from_first_voted_node: recorded,
             previous_hash: [0u8; 32],
-            signature: [0u8; 64],
+            signature: [0u8; SIGNATURE_SIZE],
         };
         let mut builder = BlockBuilder::new().header(header);
         for nt in [&nt_self, &nt_victim] {
