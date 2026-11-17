@@ -254,6 +254,14 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         (av * p.vote_interest as u32) / scale
     }
 
+    /// The FR37 step-1 interest applied to `value` under this engine's
+    /// parameters: the post-interest snapshot `I(av)` (DEC-156) a vote takes
+    /// in the next block. Fails like [`Self::apply_block`]: on overflow, and
+    /// with no parameters.
+    pub fn grown(&self, value: u32) -> Result<u32, VoteEngineError> {
+        Self::apply_growth_to_value(self.params()?, value)
+    }
+
     fn apply_growth_to_value(p: VoteParams, av: u32) -> Result<u32, VoteEngineError> {
         av.checked_add(Self::interest_bump_for(p, av))
             .ok_or(VoteEngineError::AccumulatedVoteOverflow)
@@ -580,6 +588,16 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         }
     }
 
+    /// Whether node `a` ranks above node `b` in the FR38 creator order:
+    /// accumulated vote descending, ties by ascending node id. An
+    /// out-of-bounds id ranks as a zero vote.
+    pub fn ranks_above(&self, a: u32, b: u32) -> bool {
+        key_above(
+            (self.accumulated_vote_of(a), a),
+            (self.accumulated_vote_of(b), b),
+        )
+    }
+
     /// Returns the currently expected block creator per FR38.
     ///
     /// Ordering: descending by `accumulated_vote`, tie-broken by ascending
@@ -600,14 +618,12 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     pub fn top_creator(&self) -> Option<u32> {
         let mut top: Option<(u32, u32)> = None;
         for node_id in 0..MAX_NODES {
-            let av = self.accumulated_vote[node_id];
-            match top {
-                None => top = Some((node_id as u32, av)),
-                Some((_, top_vote)) if av > top_vote => top = Some((node_id as u32, av)),
-                _ => {}
+            let key = (self.accumulated_vote[node_id], node_id as u32);
+            if top.is_none_or(|best| key_above(key, best)) {
+                top = Some(key);
             }
         }
-        top.map(|(node_id, _)| node_id)
+        top.map(|(_, node_id)| node_id)
     }
 
     /// Returns the `rank`-th creator in the FR38 descending-by-vote order.
@@ -632,18 +648,12 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
                 // Skip candidates that come at or before the cursor in the
                 // (vote_desc, node_id_asc) ordering — those are already-ranked
                 // entries.
-                if let Some(cur) = cursor {
-                    let strictly_after = key.0 < cur.0 || (key.0 == cur.0 && key.1 > cur.1);
-                    if !strictly_after {
-                        continue;
-                    }
+                if cursor.is_some_and(|cur| !key_above(cur, key)) {
+                    continue;
                 }
                 // Track the greatest candidate under the same ordering.
-                match best {
-                    None => best = Some(key),
-                    Some(b) if key.0 > b.0 => best = Some(key),
-                    Some(b) if key.0 == b.0 && key.1 < b.1 => best = Some(key),
-                    _ => {}
+                if best.is_none_or(|b| key_above(key, b)) {
+                    best = Some(key);
                 }
             }
             best?;
@@ -672,16 +682,12 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         if rank == 0 || idx >= MAX_NODES {
             return false;
         }
-        let own_vote = self.accumulated_vote[idx];
+        let own = (self.accumulated_vote[idx], node_id);
         // Count nodes strictly ahead of `node_id` in the
         // (vote_desc, node_id_asc) order; bail as soon as the band is full.
         let mut ahead = 0usize;
         for other_id in 0..MAX_NODES {
-            if other_id == idx {
-                continue;
-            }
-            let other_vote = self.accumulated_vote[other_id];
-            if other_vote > own_vote || (other_vote == own_vote && other_id < idx) {
+            if key_above((self.accumulated_vote[other_id], other_id as u32), own) {
                 ahead += 1;
                 if ahead >= rank {
                     return false;
@@ -700,6 +706,13 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
             self.accumulated_vote[idx] = value;
         }
     }
+}
+
+/// The FR38 creator order on `(accumulated_vote, node_id)` keys: `a` ranks
+/// above `b` on a higher vote, ties by the lower id. The one statement of the
+/// rule; [`VoteEngine::ranks_above`] and the rank scans use it.
+fn key_above(a: (u32, u32), b: (u32, u32)) -> bool {
+    a.0 > b.0 || (a.0 == b.0 && a.1 < b.1)
 }
 
 #[cfg(test)]
@@ -1761,6 +1774,67 @@ mod tests {
         assert!(engine.is_creator_within_rank(2, 5));
         assert!(!engine.is_creator_within_rank(2, 11));
         assert!(engine.is_creator_within_rank(3, 11));
+    }
+
+    /// Story 6.6 AC3: `grown` is the step-1 interest `apply_block` gives a
+    /// node that is neither the creator nor credited, below and above the cap.
+    #[test]
+    fn grown_matches_the_interest_apply_block_gives() {
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let below_cap = 1_234;
+        let above_cap = 40_000;
+        engine.set_accumulated_vote_for_test(3, below_cap);
+        engine.set_accumulated_vote_for_test(4, above_cap);
+        let expected = (engine.grown(below_cap), engine.grown(above_cap));
+        assert_eq!(expected, (Ok(1_234 + 61), Ok(40_000 + TEST_VOTE_SCALE)));
+        engine
+            .apply_block(make_empty_block(1, &mut buf, &crypto))
+            .expect("applies");
+        assert_eq!(
+            (
+                Ok(engine.accumulated_vote_of(3)),
+                Ok(engine.accumulated_vote_of(4))
+            ),
+            expected
+        );
+        assert_eq!(engine.grown(0), Ok(0));
+        assert_eq!(
+            engine.grown(u32::MAX),
+            Err(VoteEngineError::AccumulatedVoteOverflow)
+        );
+
+        let mut slot = core::mem::MaybeUninit::<TestEngine>::uninit();
+        let unparameterized = TestEngine::init(&mut slot);
+        assert_eq!(
+            unparameterized.grown(1),
+            Err(VoteEngineError::NotParameterized)
+        );
+    }
+
+    /// Story 6.6 AC3: `ranks_above` is the order the rank scans walk.
+    #[test]
+    fn ranks_above_is_the_creator_order() {
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(2, 500);
+        engine.set_accumulated_vote_for_test(5, 500);
+        engine.set_accumulated_vote_for_test(9, 700);
+        assert!(engine.ranks_above(9, 2), "higher vote");
+        assert!(engine.ranks_above(2, 5), "tie: lower id");
+        assert!(!engine.ranks_above(5, 2));
+        assert!(!engine.ranks_above(2, 2), "strict");
+        assert!(engine.ranks_above(5, 0), "non-zero above the zero tail");
+        assert!(engine.ranks_above(0, 1), "zero tail by ascending id");
+        assert!(
+            !engine.ranks_above(TEST_MAX_NODES as u32, 1),
+            "out of bounds is a zero vote"
+        );
+        for rank in 0..TEST_MAX_NODES - 1 {
+            let a = engine.creator_at_rank(rank).expect("ranked");
+            let b = engine.creator_at_rank(rank + 1).expect("ranked");
+            assert!(engine.ranks_above(a, b));
+        }
     }
 
     #[test]
