@@ -553,10 +553,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
             return Self::undo_growth_value(params, pre_credit);
         }
 
-        let mut value = self.accumulated_vote[node_id];
-        if credit_excluded(node_id as u32) {
-            return Self::undo_growth_value(params, value);
-        }
+        let mut credits = 0u32;
         if let Some(payload) = block.transactions() {
             for tx in payload.iter() {
                 if let Some(complex) = tx.as_complex()
@@ -565,11 +562,19 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
                     continue;
                 }
                 if tx.vote() as usize == node_id {
-                    value = value
-                        .checked_sub(params.vote_scale.get() as u32)
-                        .ok_or(VoteEngineError::AccumulatedVoteUnderflow)?;
+                    credits += 1;
                 }
             }
+        }
+        // The predicate is asked only about a node the block credited, as in
+        // the apply's preflight: the caller's reads then cover exactly the
+        // block's vote targets.
+        let mut value = self.accumulated_vote[node_id];
+        if credits > 0 && !credit_excluded(node_id as u32) {
+            value = credits
+                .checked_mul(params.vote_scale.get() as u32)
+                .and_then(|total| value.checked_sub(total))
+                .ok_or(VoteEngineError::AccumulatedVoteUnderflow)?;
         }
 
         Self::undo_growth_value(params, value)
@@ -2378,5 +2383,30 @@ mod tests {
             .apply_block(reparsed(&buf), |node| node == 4)
             .expect("no credit, no overflow");
         assert_eq!(engine.accumulated_vote[4], u32::MAX - 10);
+    }
+
+    /// The undo asks the credit predicate only about a node the block
+    /// credited, as the apply's preflight does (code review P5): the caller's
+    /// confirm reads cover exactly the block's vote targets.
+    #[test]
+    fn undo_asks_the_predicate_only_about_credited_nodes() {
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(3, 2000);
+        let crypto = test_crypto();
+        let nt = nt_with_vote(3);
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_block_view(1, 0, 1, 0, Some(nt.as_bytes()), &mut buf, &crypto);
+        engine.apply_block(block, |_| false).expect("applies");
+        let asked = core::cell::Cell::new(0u32);
+        let stray = core::cell::Cell::new(false);
+        engine
+            .undo_block(reparsed(&buf), |node| {
+                asked.set(asked.get() + 1);
+                stray.set(stray.get() || node != 3);
+                false
+            })
+            .expect("undoes");
+        assert!(!stray.get(), "only the credited node");
+        assert_eq!(asked.get(), 2, "once in the preflight, once in the commit");
     }
 }
