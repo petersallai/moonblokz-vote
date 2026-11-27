@@ -34,15 +34,16 @@
 //!    name it (the per-target credit cap, DEC-176; Story 7.2), using checked
 //!    `u32` arithmetic. Zero-input UTXO carry-forward complex transactions
 //!    count for nothing (FR51 replay-safety).
-//! 3. **Creator reset** — the block creator's `accumulated_vote` is zeroed,
-//!    so a creator voting for themselves in their own block does not retain
-//!    those votes.
-//! 4. **Liveness credit** (DEC-178, Story 7.2) — after the resets below, the
-//!    creator of block `s − H`, which the caller passes when the credit is due,
-//!    gains `⌈vote_scale / vote_interest⌉`, the smallest vote that earns
-//!    interest — unless `vote_interest = 0`, the block resets that node (its
-//!    creator, a deviation's first-voted node, DEC-342, or a fact block's
-//!    equivocator), or the caller's `credit_excluded` names it.
+//! 3. **Resets** — the block creator's `accumulated_vote` is zeroed, so a
+//!    creator voting for themselves in their own block does not retain those
+//!    votes; with it, a deviation block's first-voted node (the deviation
+//!    penalty below) and a fact block's equivocator (the twin reset below).
+//! 4. **Liveness credit** (DEC-178, Story 7.2) — after the resets, the creator
+//!    of block `s − H`, which the caller passes when the credit is due, gains
+//!    `⌈vote_scale / vote_interest⌉`, the smallest vote that earns interest —
+//!    unless `vote_interest = 0` or the caller's `credit_excluded` names it. A
+//!    node step 3 reset keeps its 0 (DEC-342 for the deviation's first-voted
+//!    node): the reset wins over the credit.
 //!
 //! Every node's result depends only on its own pre-block value and the block,
 //! so apply and undo compute it per node, first as a preflight and then as
