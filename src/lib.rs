@@ -23,19 +23,30 @@
 //!
 //! ## FR37 forward accumulation (Story 3.1)
 //!
-//! [`VoteEngine::apply_block`] applies the three FR37 steps in this order:
+//! [`VoteEngine::apply_block`] applies the FR37 steps in this order:
 //!
 //! 1. **Anti-capture interest** — every node's `accumulated_vote` gets
 //!    `av += min(floor(av × vote_interest / vote_scale), vote_scale)`
 //!    using checked `u32` arithmetic, including the creator before the later
 //!    reset. `vote_scale` is also the per-block interest bump cap.
-//! 2. **Vote credits** — every payload transaction's `vote` target node
-//!    gains one `vote_scale` credit, using checked `u32` arithmetic.
-//!    Zero-input UTXO carry-forward complex
-//!    transactions contribute no credit (FR51 replay-safety).
-//! 3. **Creator reset** — the block creator's `accumulated_vote` is zeroed.
-//!    Runs **last** so a creator voting for themselves in their own block
-//!    does not retain those votes.
+//! 2. **Vote credits** — every node named by at least one payload
+//!    transaction's `vote` gains exactly one `vote_scale` credit, however many
+//!    name it (the per-target credit cap, DEC-176; Story 7.2), using checked
+//!    `u32` arithmetic. Zero-input UTXO carry-forward complex transactions
+//!    count for nothing (FR51 replay-safety).
+//! 3. **Creator reset** — the block creator's `accumulated_vote` is zeroed,
+//!    so a creator voting for themselves in their own block does not retain
+//!    those votes.
+//! 4. **Liveness credit** (DEC-178, Story 7.2) — after the resets below, the
+//!    creator of block `s − H`, which the caller passes when the credit is due,
+//!    gains `⌈vote_scale / vote_interest⌉`, the smallest vote that earns
+//!    interest — unless `vote_interest = 0`, the block resets that node (its
+//!    creator, a deviation's first-voted node, DEC-342, or a fact block's
+//!    equivocator), or the caller's `credit_excluded` names it.
+//!
+//! Every node's result depends only on its own pre-block value and the block,
+//! so apply and undo compute it per node, first as a preflight and then as
+//! the commit: a failing step mutates nothing.
 //!
 //! Deviation-block penalty: a deviation block is one whose `first_voted_node`
 //! differs from its creator (FR45); the `first_voted_node`'s accumulated vote is
@@ -351,108 +362,127 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         Err(VoteEngineError::UnreachableInterestState)
     }
 
-    /// Applies the FR37 three-step forward accumulation for `block`.
+    /// Applies the FR37 forward accumulation for `block` (steps 1–4).
     ///
     /// See module-level docs for the step ordering and rationale. Returns an
     /// error instead of saturating if an accepted block would overflow the
     /// reversible `u32` accumulated-vote state. `credit_excluded(node)` names
-    /// the nodes whose step-2 credits this block drops (FR72): a transaction
-    /// voting for one stays valid, only its credit is lost.
+    /// the nodes whose credits this block drops (FR72, and later the late-node
+    /// hold): a transaction voting for one stays valid, only its credit is lost.
+    /// `liveness` is the creator of block `s − H` when the step-4 liveness credit
+    /// is due (DEC-178: `s ≥ H`, and in a window-anchored FR3 pass `s ≥ a + H`);
+    /// the engine applies its own exclusions ([`Self::liveness_target`]).
+    ///
+    /// Atomic on failure: every node's post-apply value is preflighted before
+    /// any slot is written, so an error leaves the state unchanged.
     pub fn apply_block(
         &mut self,
         block: BlockView<'_>,
         credit_excluded: impl Fn(u32) -> bool,
+        liveness: Option<u32>,
     ) -> Result<(), VoteEngineError> {
         let params = self.params()?;
-        let creator = block.creator();
-        let vote_scale = params.vote_scale.get() as u32;
-
-        // Preflight all interest and vote-credit additions before mutating so
-        // arithmetic errors fail closed and do not leave partially-updated state.
+        let target = Self::liveness_target(params, &block, liveness, &credit_excluded);
+        // Preflight: compute every node's post-apply value without mutating, so
+        // arithmetic errors fail closed and leave the state unchanged.
         for node_id in 0..MAX_NODES {
-            let post_interest =
-                Self::apply_growth_to_value(params, self.accumulated_vote[node_id])?;
-            if let Some(payload) = block.transactions() {
-                let mut credit_count = 0u32;
-                for tx in payload.iter() {
-                    if let Some(complex) = tx.as_complex()
-                        && complex.input_count() == 0
-                    {
-                        continue;
-                    }
-                    if tx.vote() as usize == node_id {
-                        credit_count = credit_count
-                            .checked_add(1)
-                            .ok_or(VoteEngineError::AccumulatedVoteOverflow)?;
-                    }
-                }
-                if credit_count > 0 && !credit_excluded(node_id as u32) {
-                    let credit_total = credit_count
-                        .checked_mul(vote_scale)
-                        .ok_or(VoteEngineError::AccumulatedVoteOverflow)?;
-                    post_interest
-                        .checked_add(credit_total)
-                        .ok_or(VoteEngineError::AccumulatedVoteOverflow)?;
-                }
-            }
+            self.apply_value_for(params, node_id, &block, target, &credit_excluded)?;
         }
-
-        // === Step 1: anti-capture interest to every node, including creator ===
+        // Commit: the identical per-node computation, now writing. Each node's
+        // value depends only on its own pre-apply slot plus the block.
         for node_id in 0..MAX_NODES {
             self.accumulated_vote[node_id] =
-                Self::apply_growth_to_value(params, self.accumulated_vote[node_id])?;
+                self.apply_value_for(params, node_id, &block, target, &credit_excluded)?;
         }
-
-        // === Step 2: vote credits from payload transactions ===
-        if let Some(payload) = block.transactions() {
-            for tx in payload.iter() {
-                // FR51 replay-safety: zero-input UTXO carry-forward
-                // contributes no vote credit.
-                if let Some(complex) = tx.as_complex()
-                    && complex.input_count() == 0
-                {
-                    continue;
-                }
-                let target = tx.vote() as usize;
-                if target >= MAX_NODES {
-                    // Out-of-bounds target: upstream validation (FR6) should
-                    // have rejected. Defensively skip rather than panic.
-                    continue;
-                }
-                if credit_excluded(target as u32) {
-                    continue;
-                }
-                self.accumulated_vote[target] = self.accumulated_vote[target]
-                    .checked_add(vote_scale)
-                    .ok_or(VoteEngineError::AccumulatedVoteOverflow)?;
-            }
-        }
-
-        // === Step 3: creator reset (comes last, wipes any self-credit) ===
-        let creator_idx = creator as usize;
-        if creator_idx < MAX_NODES {
-            self.accumulated_vote[creator_idx] = 0;
-        }
-
-        // === Deviation-block penalty (FR47) ===
-        // A deviation block names a first-voted node other than its creator
-        // (FR45). Its snapshot is verified by `check_header` before the apply;
-        // the penalty resets the node whatever credits this block gave it.
-        let victim = block.first_voted_node();
-        if victim != creator && (victim as usize) < MAX_NODES {
-            self.accumulated_vote[victim as usize] = 0;
-        }
-
-        // === Twin reset (FR72) ===
-        // A fact block has no transactions, so its snapshot is `c`'s
-        // post-interest value, which Tier 3 checks before the apply.
-        if let Some((equivocator, _)) = twin_reset(&block)
-            && (equivocator as usize) < MAX_NODES
-        {
-            self.accumulated_vote[equivocator as usize] = 0;
-        }
-
         Ok(())
+    }
+
+    /// One node's post-apply accumulated vote, without mutating anything, in
+    /// FR37 order:
+    ///
+    /// 1. anti-capture interest (every node, the creator included);
+    /// 2. one `vote_scale` credit if at least one counted transaction names the
+    ///    node, however many do (the per-target cap, DEC-176), none to a
+    ///    credit-excluded node;
+    /// 3. the creator reset; then the deviation penalty (FR47: a first-voted
+    ///    node other than the creator, its snapshot verified by `check_header`)
+    ///    and the twin reset (FR72), which wipe whatever credits the block gave;
+    /// 4. the liveness credit `⌈vote_scale / vote_interest⌉` to `target`
+    ///    (DEC-178), which is never a node the block resets.
+    fn apply_value_for(
+        &self,
+        params: VoteParams,
+        node_id: usize,
+        block: &BlockView<'_>,
+        target: Option<usize>,
+        credit_excluded: &impl Fn(u32) -> bool,
+    ) -> Result<u32, VoteEngineError> {
+        let mut value = Self::apply_growth_to_value(params, self.accumulated_vote[node_id])?;
+        if Self::credited(block, node_id) && !credit_excluded(node_id as u32) {
+            value = value
+                .checked_add(params.vote_scale.get() as u32)
+                .ok_or(VoteEngineError::AccumulatedVoteOverflow)?;
+        }
+        if Self::reset_by(block, node_id) {
+            return Ok(0);
+        }
+        if target == Some(node_id) {
+            value = value
+                .checked_add(Self::liveness_credit(params))
+                .ok_or(VoteEngineError::AccumulatedVoteOverflow)?;
+        }
+        Ok(value)
+    }
+
+    /// Whether at least one of `block`'s counted transactions votes for
+    /// `node_id`. FR51 replay-safety: a zero-input UTXO carry-forward counts
+    /// for nothing. A target at or beyond `MAX_NODES` never matches a node.
+    fn credited(block: &BlockView<'_>, node_id: usize) -> bool {
+        block.transactions().is_some_and(|payload| {
+            payload.iter().any(|tx| {
+                tx.as_complex()
+                    .is_none_or(|complex| complex.input_count() != 0)
+                    && tx.vote() as usize == node_id
+            })
+        })
+    }
+
+    /// Whether `block` resets `node_id`: its creator (step 3), a deviation's
+    /// first-voted node (FR47) or a fact block's equivocator (FR72).
+    fn reset_by(block: &BlockView<'_>, node_id: usize) -> bool {
+        let creator = block.creator() as usize;
+        let first_voted = block.first_voted_node() as usize;
+        node_id == creator
+            || (first_voted != creator && node_id == first_voted)
+            || twin_reset(block).is_some_and(|(equivocator, _)| equivocator as usize == node_id)
+    }
+
+    /// The step-4 liveness credit `F = ⌈vote_scale / vote_interest⌉` (DEC-178);
+    /// only called with `vote_interest > 0`.
+    fn liveness_credit(params: VoteParams) -> u32 {
+        (params.vote_scale.get() as u32).div_ceil(params.vote_interest as u32)
+    }
+
+    /// The node the step-4 liveness credit goes to, if any (DEC-178): the
+    /// caller's `liveness` candidate (the creator of block `s − H`) unless
+    /// `vote_interest = 0`, the candidate is a node `block` resets — its
+    /// creator, the equivocator a fact block names, or the originally-top node
+    /// a deviation block penalizes (DEC-342) — or it is credit-excluded (the
+    /// FR72 credit drop; the late-node hold, Story 7.7). Apply and undo derive
+    /// it identically.
+    fn liveness_target(
+        params: VoteParams,
+        block: &BlockView<'_>,
+        liveness: Option<u32>,
+        credit_excluded: &impl Fn(u32) -> bool,
+    ) -> Option<usize> {
+        let node = liveness?;
+        let idx = node as usize;
+        (params.vote_interest > 0
+            && idx < MAX_NODES
+            && !Self::reset_by(block, idx)
+            && !credit_excluded(node))
+        .then_some(idx)
     }
 
     /// Applies the exact inverse of [`apply_block`](Self::apply_block).
@@ -484,8 +514,10 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         &mut self,
         block: BlockView<'_>,
         credit_excluded: impl Fn(u32) -> bool,
+        liveness: Option<u32>,
     ) -> Result<(), VoteEngineError> {
         let params = self.params()?;
+        let target = Self::liveness_target(params, &block, liveness, &credit_excluded);
         let creator_idx = block.creator() as usize;
         // Only a deviation block (`first_voted_node != creator`, FR45) penalized
         // a second node and recorded its snapshot.
@@ -505,15 +537,28 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         // Preflight: compute every node's post-undo value without mutating, so
         // arithmetic errors fail closed and leave the state unchanged.
         for node_id in 0..MAX_NODES {
-            self.undo_value_for(params, node_id, &block, &snapshots, &credit_excluded)?;
+            self.undo_value_for(
+                params,
+                node_id,
+                &block,
+                &snapshots,
+                target,
+                &credit_excluded,
+            )?;
         }
 
         // Commit: repeat the identical per-node computation, now writing. Each
         // node's value depends only on its own pre-undo slot plus the block,
         // so in-place writes cannot influence later nodes.
         for node_id in 0..MAX_NODES {
-            self.accumulated_vote[node_id] =
-                self.undo_value_for(params, node_id, &block, &snapshots, &credit_excluded)?;
+            self.accumulated_vote[node_id] = self.undo_value_for(
+                params,
+                node_id,
+                &block,
+                &snapshots,
+                target,
+                &credit_excluded,
+            )?;
         }
         Ok(())
     }
@@ -528,9 +573,11 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
     ///   with no credit subtraction — the reset or penalty wiped the credits. A
     ///   fact block carries no transactions, so where two of them name one node
     ///   the snapshots are equal, which Tier 3 checks.
-    /// - Every other node — step 2 rollback: subtract one `vote_scale` per
-    ///   credit the block's payload gave it (FR51 zero-input carry-forward skip
-    ///   mirrored; none for a credit-excluded node, which got none).
+    /// - Every other node — step 4 rollback: subtract the liveness credit if it
+    ///   is the block's liveness target; step 2 rollback: subtract the one
+    ///   `vote_scale` credit if the block's payload named it (the per-target
+    ///   cap, DEC-176; FR51 zero-input carry-forward skip mirrored; none for a
+    ///   credit-excluded node, which got none).
     /// - Step 1 rollback: exact pre-image of the capped interest growth.
     fn undo_value_for(
         &self,
@@ -538,6 +585,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         node_id: usize,
         block: &BlockView<'_>,
         snapshots: &Snapshots,
+        target: Option<usize>,
         credit_excluded: &impl Fn(u32) -> bool,
     ) -> Result<u32, VoteEngineError> {
         let snapshot = if node_id == snapshots.creator_idx {
@@ -553,27 +601,18 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
             return Self::undo_growth_value(params, pre_credit);
         }
 
-        let mut credits = 0u32;
-        if let Some(payload) = block.transactions() {
-            for tx in payload.iter() {
-                if let Some(complex) = tx.as_complex()
-                    && complex.input_count() == 0
-                {
-                    continue;
-                }
-                if tx.vote() as usize == node_id {
-                    credits += 1;
-                }
-            }
-        }
-        // The predicate is asked only about a node the block credited, as in
-        // the apply's preflight: the caller's reads then cover exactly the
-        // block's vote targets.
         let mut value = self.accumulated_vote[node_id];
-        if credits > 0 && !credit_excluded(node_id as u32) {
-            value = credits
-                .checked_mul(params.vote_scale.get() as u32)
-                .and_then(|total| value.checked_sub(total))
+        if target == Some(node_id) {
+            value = value
+                .checked_sub(Self::liveness_credit(params))
+                .ok_or(VoteEngineError::AccumulatedVoteUnderflow)?;
+        }
+        // The predicate is asked only about a node the block credited (and the
+        // liveness candidate), as in the apply: the caller's reads then cover
+        // exactly the block's vote targets and that candidate.
+        if Self::credited(block, node_id) && !credit_excluded(node_id as u32) {
+            value = value
+                .checked_sub(params.vote_scale.get() as u32)
                 .ok_or(VoteEngineError::AccumulatedVoteUnderflow)?;
         }
 
@@ -1001,11 +1040,11 @@ mod tests {
         let mut buf_c = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
 
         assert_eq!(
-            engine.apply_block(make_empty_block(3, &mut buf_a, &crypto), |_| false),
+            engine.apply_block(make_empty_block(3, &mut buf_a, &crypto), |_| false, None),
             Err(VoteEngineError::NotParameterized)
         );
         assert_eq!(
-            engine.undo_block(make_empty_block(3, &mut buf_b, &crypto), |_| false),
+            engine.undo_block(make_empty_block(3, &mut buf_b, &crypto), |_| false, None),
             Err(VoteEngineError::NotParameterized)
         );
         assert!(engine.accumulated_vote.iter().all(|&v| v == 0));
@@ -1015,7 +1054,7 @@ mod tests {
         engine.reset(test_vote_scale(), TEST_VOTE_INTEREST);
         assert!(
             engine
-                .apply_block(make_empty_block(3, &mut buf_c, &crypto), |_| false)
+                .apply_block(make_empty_block(3, &mut buf_c, &crypto), |_| false, None)
                 .is_ok()
         );
     }
@@ -1041,7 +1080,7 @@ mod tests {
         let block = make_empty_block(3, &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
 
         for i in 0..TEST_MAX_NODES {
@@ -1061,7 +1100,7 @@ mod tests {
         let block = make_empty_block(3, &mut buf, &crypto); // creator = 3
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
 
         // 2000 + min(floor(2000 * 50 / 1000), 1000) = 2100
@@ -1083,7 +1122,7 @@ mod tests {
         let block = make_empty_block(3, &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
 
         assert_eq!(engine.accumulated_vote[2], 41_000);
@@ -1098,7 +1137,7 @@ mod tests {
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_empty_block(3, &mut buf, &crypto);
 
-        let result = engine.apply_block(block, |_| false);
+        let result = engine.apply_block(block, |_| false, None);
 
         assert_eq!(result, Err(VoteEngineError::AccumulatedVoteOverflow));
         assert_eq!(engine.accumulated_vote[2], u32::MAX - 999);
@@ -1113,7 +1152,7 @@ mod tests {
         let block = make_block_view(3, 0, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
 
         assert_eq!(engine.accumulated_vote[5], TEST_VOTE_SCALE);
@@ -1129,7 +1168,7 @@ mod tests {
         let block = make_block_view(3, 0, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
 
         assert_eq!(engine.accumulated_vote[0], TEST_VOTE_SCALE);
@@ -1146,7 +1185,7 @@ mod tests {
         let block = make_block_view(3, 0, 3, 0, Some(complex.as_bytes()), &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
 
         assert_eq!(engine.accumulated_vote[7], 0);
@@ -1162,7 +1201,7 @@ mod tests {
         let block = make_empty_block(3, &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
 
         assert_eq!(engine.accumulated_vote[3], 0);
@@ -1178,7 +1217,7 @@ mod tests {
         let block = make_block_view(3, 0, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
 
         assert_eq!(engine.accumulated_vote[3], 0);
@@ -1196,7 +1235,7 @@ mod tests {
         let block = make_block_view(5, 0, 2, 1, None, &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
 
         assert_eq!(engine.accumulated_vote[2], 0);
@@ -1214,7 +1253,7 @@ mod tests {
         let block = make_block_view(5, 0, 5, 0, None, &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
 
         // 4000 + min(floor(4000 * 50 / 1000), 1000) = 4200
@@ -1232,14 +1271,14 @@ mod tests {
             let nt1 = nt_with_vote(5);
             let block1 = make_block_view(3, 0, 3, 0, Some(nt1.as_bytes()), &mut buf1, &crypto);
             engine
-                .apply_block(block1, |_| false)
+                .apply_block(block1, |_| false, None)
                 .expect("apply block must succeed");
 
             let mut buf2 = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
             let nt2 = nt_with_vote(5);
             let block2 = make_block_view(7, 0, 7, 0, Some(nt2.as_bytes()), &mut buf2, &crypto);
             engine
-                .apply_block(block2, |_| false)
+                .apply_block(block2, |_| false, None)
                 .expect("apply block must succeed");
 
             engine.accumulated_vote
@@ -1273,7 +1312,7 @@ mod tests {
         let block = make_block_view(3, 2100, 3, 0, None, &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
         assert_eq!(engine.accumulated_vote[3], 0);
 
@@ -1282,7 +1321,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
         engine
-            .undo_block(block_for_undo, |_| false)
+            .undo_block(block_for_undo, |_| false, None)
             .expect("undo block must succeed");
 
         assert_eq!(engine.accumulated_vote[3], 2000);
@@ -1299,7 +1338,7 @@ mod tests {
         let block = make_block_view(3, 0, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
         assert_eq!(engine.accumulated_vote[5], TEST_VOTE_SCALE);
 
@@ -1307,7 +1346,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
         engine
-            .undo_block(block_for_undo, |_| false)
+            .undo_block(block_for_undo, |_| false, None)
             .expect("undo block must succeed");
 
         assert_eq!(engine.accumulated_vote[5], 0);
@@ -1327,7 +1366,7 @@ mod tests {
         let block = make_empty_block(4, &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
         // Post-interest values:
         assert_eq!(engine.accumulated_vote[2], 2100);
@@ -1338,7 +1377,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
         engine
-            .undo_block(block_for_undo, |_| false)
+            .undo_block(block_for_undo, |_| false, None)
             .expect("undo block must succeed");
 
         assert_eq!(engine.accumulated_vote[2], 2000);
@@ -1359,7 +1398,7 @@ mod tests {
         let block = make_empty_block(4, &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
         assert_eq!(engine.accumulated_vote[2], 19);
         assert_eq!(engine.accumulated_vote[5], 22);
@@ -1368,7 +1407,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
         engine
-            .undo_block(block_for_undo, |_| false)
+            .undo_block(block_for_undo, |_| false, None)
             .expect("undo block must succeed");
 
         assert_eq!(engine.accumulated_vote[2], 19);
@@ -1391,7 +1430,7 @@ mod tests {
         let block = make_empty_block(4, &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
         assert_eq!(engine.accumulated_vote[2], 21_000);
         assert_eq!(engine.accumulated_vote[5], 26_000);
@@ -1401,7 +1440,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
         engine
-            .undo_block(block_for_undo, |_| false)
+            .undo_block(block_for_undo, |_| false, None)
             .expect("undo block must succeed");
 
         assert_eq!(engine.accumulated_vote[2], 20_000);
@@ -1424,7 +1463,7 @@ mod tests {
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_empty_block(4, &mut buf, &crypto);
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
         assert_eq!(engine.accumulated_vote[5], 3);
 
@@ -1432,7 +1471,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
         engine
-            .undo_block(block_for_undo, |_| false)
+            .undo_block(block_for_undo, |_| false, None)
             .expect("undo block must succeed");
         assert_eq!(engine.accumulated_vote[5], 1);
 
@@ -1440,7 +1479,7 @@ mod tests {
         // report it — without underflow panic on `after - bump(after)`.
         let mut buf2 = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block2 = make_empty_block(4, &mut buf2, &crypto);
-        let result = engine.undo_block(block2, |_| false);
+        let result = engine.undo_block(block2, |_| false, None);
         assert_eq!(result, Err(VoteEngineError::UnreachableInterestState));
     }
 
@@ -1459,7 +1498,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
 
-        let result = engine.undo_block(block_for_undo, |_| false);
+        let result = engine.undo_block(block_for_undo, |_| false, None);
 
         assert_eq!(result, Err(VoteEngineError::UnreachableInterestState));
     }
@@ -1478,7 +1517,7 @@ mod tests {
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_empty_block(4, &mut buf, &crypto);
 
-        let result = engine.undo_block(block, |_| false);
+        let result = engine.undo_block(block, |_| false, None);
 
         assert_eq!(result, Err(VoteEngineError::UnreachableInterestState));
         assert_eq!(
@@ -1501,7 +1540,7 @@ mod tests {
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_block_view(3, 0, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
 
-        let result = engine.undo_block(block, |_| false);
+        let result = engine.undo_block(block, |_| false, None);
 
         assert_eq!(result, Err(VoteEngineError::AccumulatedVoteUnderflow));
         assert_eq!(
@@ -1525,7 +1564,7 @@ mod tests {
         let block = make_block_view(5, 0, 3, 4200, None, &mut buf, &crypto);
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
         assert_eq!(engine.accumulated_vote[3], 0);
 
@@ -1533,7 +1572,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
         engine
-            .undo_block(block_for_undo, |_| false)
+            .undo_block(block_for_undo, |_| false, None)
             .expect("undo block must succeed");
 
         assert_eq!(engine.accumulated_vote[3], 4000);
@@ -1552,21 +1591,21 @@ mod tests {
         let mut buf_a = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block_a = make_empty_block(4, &mut buf_a, &crypto);
         engine
-            .apply_block(block_a, |_| false)
+            .apply_block(block_a, |_| false, None)
             .expect("apply block must succeed");
 
         // Block B: creator 6, empty.
         let mut buf_b = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block_b = make_empty_block(6, &mut buf_b, &crypto);
         engine
-            .apply_block(block_b, |_| false)
+            .apply_block(block_b, |_| false, None)
             .expect("apply block must succeed");
 
         // Block C: creator 8, empty.
         let mut buf_c = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block_c = make_empty_block(8, &mut buf_c, &crypto);
         engine
-            .apply_block(block_c, |_| false)
+            .apply_block(block_c, |_| false, None)
             .expect("apply block must succeed");
 
         // Undo in reverse: C, B, A.
@@ -1574,21 +1613,21 @@ mod tests {
             .ok()
             .expect("block C buffer must reparse");
         engine
-            .undo_block(block_c_undo, |_| false)
+            .undo_block(block_c_undo, |_| false, None)
             .expect("undo block must succeed");
 
         let block_b_undo = BlockView::from_bytes(&buf_b[..])
             .ok()
             .expect("block B buffer must reparse");
         engine
-            .undo_block(block_b_undo, |_| false)
+            .undo_block(block_b_undo, |_| false, None)
             .expect("undo block must succeed");
 
         let block_a_undo = BlockView::from_bytes(&buf_a[..])
             .ok()
             .expect("block A buffer must reparse");
         engine
-            .undo_block(block_a_undo, |_| false)
+            .undo_block(block_a_undo, |_| false, None)
             .expect("undo block must succeed");
 
         assert_eq!(
@@ -1736,7 +1775,7 @@ mod tests {
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_empty_block(5, &mut buf, &crypto);
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
 
         assert_eq!(engine.top_creator(), Some(7));
@@ -1756,7 +1795,7 @@ mod tests {
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_block_view(3, 2100, 3, 0, None, &mut buf, &crypto);
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
         // After apply: av[3] = 0, av[7] = 105 → top = 7.
         assert_eq!(engine.top_creator(), Some(7));
@@ -1765,7 +1804,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
         engine
-            .undo_block(block_for_undo, |_| false)
+            .undo_block(block_for_undo, |_| false, None)
             .expect("undo block must succeed");
 
         // After undo: av[3] = 2000, av[7] = 100 → top = 3 again.
@@ -1902,7 +1941,7 @@ mod tests {
         let expected = (engine.grown(below_cap), engine.grown(above_cap));
         assert_eq!(expected, (Ok(1_234 + 61), Ok(40_000 + TEST_VOTE_SCALE)));
         engine
-            .apply_block(make_empty_block(1, &mut buf, &crypto), |_| false)
+            .apply_block(make_empty_block(1, &mut buf, &crypto), |_| false, None)
             .expect("applies");
         assert_eq!(
             (
@@ -2071,7 +2110,7 @@ mod tests {
         assert_eq!(engine.check_header(&block, true, |_| true), Ok(true));
 
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
         assert_eq!(engine.accumulated_vote[5], 0);
         assert_eq!(engine.accumulated_vote[3], 0);
@@ -2080,7 +2119,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
         engine
-            .undo_block(block_for_undo, |_| false)
+            .undo_block(block_for_undo, |_| false, None)
             .expect("undo block must succeed");
         assert_eq!(engine.accumulated_vote, pre_state);
     }
@@ -2095,7 +2134,7 @@ mod tests {
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = deviation_with_credits(&mut buf, &crypto, 0, 0);
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
         assert_eq!(engine.accumulated_vote[3], 0);
 
@@ -2103,7 +2142,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
         engine
-            .undo_block(block_for_undo, |_| false)
+            .undo_block(block_for_undo, |_| false, None)
             .expect("undo block must succeed");
         assert_eq!(engine.accumulated_vote[3], 0);
         assert_eq!(engine.accumulated_vote[5], 0);
@@ -2121,7 +2160,7 @@ mod tests {
         let block = make_block_view(3, 2100, 3, 0, Some(nt.as_bytes()), &mut buf, &crypto);
         assert_eq!(engine.check_header(&block, true, |_| true), Ok(true));
         engine
-            .apply_block(block, |_| false)
+            .apply_block(block, |_| false, None)
             .expect("apply block must succeed");
         assert_eq!(engine.accumulated_vote[3], 0);
 
@@ -2129,7 +2168,7 @@ mod tests {
             .ok()
             .expect("buffer must still parse for undo");
         engine
-            .undo_block(block_for_undo, |_| false)
+            .undo_block(block_for_undo, |_| false, None)
             .expect("undo block must succeed");
         assert_eq!(engine.accumulated_vote[3], 2000);
     }
@@ -2300,7 +2339,7 @@ mod tests {
             &mut buf,
             &crypto,
         );
-        engine.apply_block(block, |_| false).expect("applies");
+        engine.apply_block(block, |_| false, None).expect("applies");
         assert_eq!(engine.accumulated_vote[5], 0, "the twin reset");
         assert_eq!(engine.accumulated_vote[2], 0, "the creator reset");
         assert_eq!(
@@ -2309,7 +2348,7 @@ mod tests {
             "interest only"
         );
         engine
-            .undo_block(reparsed(&buf), |_| false)
+            .undo_block(reparsed(&buf), |_| false, None)
             .expect("undoes");
         assert_eq!(engine.accumulated_vote, before);
     }
@@ -2323,10 +2362,10 @@ mod tests {
         let grown = engine.grown(4000).unwrap();
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_twin_fact_block(5, grown, 5, grown, &mut buf, &crypto);
-        engine.apply_block(block, |_| false).expect("applies");
+        engine.apply_block(block, |_| false, None).expect("applies");
         assert_eq!(engine.accumulated_vote[5], 0);
         engine
-            .undo_block(reparsed(&buf), |_| false)
+            .undo_block(reparsed(&buf), |_| false, None)
             .expect("undoes");
         assert_eq!(engine.accumulated_vote, before);
     }
@@ -2345,7 +2384,7 @@ mod tests {
             let nt = nt_with_vote(vote);
             let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
             let block = make_block_view(1, 0, 1, 0, Some(nt.as_bytes()), &mut buf, &crypto);
-            engine.apply_block(block, excluded).expect("applies");
+            engine.apply_block(block, excluded, None).expect("applies");
             let interest_only = engine.grown(2000).unwrap();
             let expected = if credited {
                 interest_only + TEST_VOTE_SCALE
@@ -2356,7 +2395,9 @@ mod tests {
                 engine.accumulated_vote[vote as usize], expected,
                 "vote for {vote}"
             );
-            engine.undo_block(reparsed(&buf), excluded).expect("undoes");
+            engine
+                .undo_block(reparsed(&buf), excluded, None)
+                .expect("undoes");
             assert_eq!(engine.accumulated_vote, before, "vote for {vote}");
         }
     }
@@ -2375,12 +2416,12 @@ mod tests {
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_block_view(1, 0, 1, 0, Some(nt.as_bytes()), &mut buf, &crypto);
         assert_eq!(
-            engine.apply_block(block, |_| false),
+            engine.apply_block(block, |_| false, None),
             Err(VoteEngineError::AccumulatedVoteOverflow)
         );
         assert_eq!(engine.accumulated_vote, before, "nothing applied");
         engine
-            .apply_block(reparsed(&buf), |node| node == 4)
+            .apply_block(reparsed(&buf), |node| node == 4, None)
             .expect("no credit, no overflow");
         assert_eq!(engine.accumulated_vote[4], u32::MAX - 10);
     }
@@ -2396,17 +2437,208 @@ mod tests {
         let nt = nt_with_vote(3);
         let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
         let block = make_block_view(1, 0, 1, 0, Some(nt.as_bytes()), &mut buf, &crypto);
-        engine.apply_block(block, |_| false).expect("applies");
+        engine.apply_block(block, |_| false, None).expect("applies");
         let asked = core::cell::Cell::new(0u32);
         let stray = core::cell::Cell::new(false);
         engine
-            .undo_block(reparsed(&buf), |node| {
-                asked.set(asked.get() + 1);
-                stray.set(stray.get() || node != 3);
-                false
-            })
+            .undo_block(
+                reparsed(&buf),
+                |node| {
+                    asked.set(asked.get() + 1);
+                    stray.set(stray.get() || node != 3);
+                    false
+                },
+                None,
+            )
             .expect("undoes");
         assert!(!stray.get(), "only the credited node");
         assert_eq!(asked.get(), 2, "once in the preflight, once in the commit");
+    }
+
+    // --- Story 7.2: the per-target credit cap (DEC-176) and the liveness credit (DEC-178) ---
+
+    /// A transaction block with one node transfer per entry of `votes`.
+    fn make_votes_block<'a>(
+        creator: u32,
+        consumed_votes: u32,
+        first_voted_node: u32,
+        consumed_votes_from_first_voted_node: u32,
+        votes: &[u32],
+        buffer: &'a mut [u8; moonblokz_chain_types::MAX_BLOCK_SIZE],
+        crypto: &Crypto,
+    ) -> BlockView<'a> {
+        let mut builder = BlockBuilder::new().header(BlockHeader {
+            version: 1,
+            sequence: 0,
+            creator,
+            mined_amount: 0,
+            payload_type: PAYLOAD_TYPE_TRANSACTION,
+            consumed_votes,
+            first_voted_node,
+            consumed_votes_from_first_voted_node,
+            previous_hash: [0u8; 32],
+            signature: [0u8; SIGNATURE_SIZE],
+        });
+        for &vote in votes {
+            builder
+                .add_transaction_bytes(nt_with_vote(vote).as_bytes())
+                .ok()
+                .expect("test tx must fit in the block payload");
+        }
+        let block = builder
+            .build_signed(crypto)
+            .ok()
+            .expect("test block must build");
+        let serialized = block.serialized_bytes();
+        buffer[..serialized.len()].copy_from_slice(serialized);
+        BlockView::from_bytes(&buffer[..serialized.len()])
+            .ok()
+            .expect("just-built block must parse")
+    }
+
+    #[test]
+    fn a_node_named_by_several_transactions_gets_one_credit_and_undo_removes_one() {
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(3, 2000);
+        let before = engine.accumulated_vote;
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_votes_block(1, 0, 1, 0, &[3, 3, 3, 5], &mut buf, &crypto);
+        engine.apply_block(block, |_| false, None).expect("applies");
+        // 2000 + 5 % interest, then exactly one credit however many name it.
+        assert_eq!(engine.accumulated_vote[3], 2100 + TEST_VOTE_SCALE);
+        assert_eq!(engine.accumulated_vote[5], TEST_VOTE_SCALE);
+        engine
+            .undo_block(reparsed(&buf), |_| false, None)
+            .expect("undoes");
+        assert_eq!(engine.accumulated_vote, before);
+    }
+
+    #[test]
+    fn a_creator_naming_itself_twice_still_ends_at_zero() {
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_votes_block(1, 0, 1, 0, &[1, 1, 2], &mut buf, &crypto);
+        engine.apply_block(block, |_| false, None).expect("applies");
+        assert_eq!(engine.accumulated_vote[1], 0);
+        assert_eq!(engine.accumulated_vote[2], TEST_VOTE_SCALE);
+        engine
+            .undo_block(reparsed(&buf), |_| false, None)
+            .expect("undoes");
+        assert_eq!(engine.accumulated_vote, [0; TEST_MAX_NODES]);
+    }
+
+    #[test]
+    fn the_liveness_credit_goes_to_the_candidate_and_undo_removes_it() {
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        engine.set_accumulated_vote_for_test(7, 100);
+        let before = engine.accumulated_vote;
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_votes_block(1, 0, 1, 0, &[7], &mut buf, &crypto);
+        engine
+            .apply_block(block, |_| false, Some(7))
+            .expect("applies");
+        // F = ⌈1000 / 50⌉ = 20, after interest (105) and the one credit.
+        assert_eq!(engine.accumulated_vote[7], 105 + TEST_VOTE_SCALE + 20);
+        engine
+            .undo_block(reparsed(&buf), |_| false, Some(7))
+            .expect("undoes");
+        assert_eq!(engine.accumulated_vote, before);
+    }
+
+    #[test]
+    fn the_liveness_credit_is_the_smallest_vote_that_earns_interest() {
+        // F = ⌈vs / vi⌉ rounds up: at vs 1000, vi 30 it is 34 (33 would earn 0).
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), 30);
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_empty_block(1, &mut buf, &crypto);
+        engine
+            .apply_block(block, |_| false, Some(4))
+            .expect("applies");
+        assert_eq!(engine.accumulated_vote[4], 34);
+        assert_eq!(engine.grown(34), Ok(35));
+    }
+
+    #[test]
+    fn the_liveness_credit_skips_every_excluded_candidate() {
+        let crypto = test_crypto();
+        let check = |engine: &mut TestEngine,
+                     block: BlockView<'_>,
+                     undo: BlockView<'_>,
+                     excluded: &dyn Fn(u32) -> bool,
+                     candidate: u32,
+                     expect: u32| {
+            let before = engine.accumulated_vote;
+            engine
+                .apply_block(block, excluded, Some(candidate))
+                .expect("applies");
+            assert_eq!(engine.accumulated_vote[candidate as usize], expect);
+            engine
+                .undo_block(undo, excluded, Some(candidate))
+                .expect("undoes");
+            assert_eq!(engine.accumulated_vote, before, "exact undo");
+        };
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        let (mut a, mut b) = (
+            [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE],
+            [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE],
+        );
+        // The creator of `s` itself.
+        make_empty_block(2, &mut a, &crypto);
+        make_empty_block(2, &mut b, &crypto);
+        check(&mut engine, reparsed(&a), reparsed(&b), &|_| false, 2, 0);
+        // The originally-top node a deviation block penalizes (DEC-342): it
+        // stays at the 0 the penalty set. Its snapshot is its post-interest value.
+        engine.set_accumulated_vote_for_test(3, 400);
+        make_block_view(5, 0, 3, 420, None, &mut a, &crypto);
+        make_block_view(5, 0, 3, 420, None, &mut b, &crypto);
+        check(&mut engine, reparsed(&a), reparsed(&b), &|_| false, 3, 0);
+        // The equivocator a fact block resets (snapshot = post-interest value).
+        make_twin_fact_block(5, 0, 3, 420, &mut a, &crypto);
+        make_twin_fact_block(5, 0, 3, 420, &mut b, &crypto);
+        check(&mut engine, reparsed(&a), reparsed(&b), &|_| false, 3, 0);
+        // A credit-excluded candidate (the FR72 drop; the late-node hold later).
+        make_empty_block(2, &mut a, &crypto);
+        make_empty_block(2, &mut b, &crypto);
+        check(
+            &mut engine,
+            reparsed(&a),
+            reparsed(&b),
+            &|node| node == 3,
+            3,
+            420,
+        );
+        // A candidate beyond the roster capacity.
+        let before = engine.accumulated_vote;
+        engine
+            .apply_block(reparsed(&a), |_| false, Some(TEST_MAX_NODES as u32))
+            .expect("applies");
+        engine
+            .undo_block(reparsed(&b), |_| false, Some(TEST_MAX_NODES as u32))
+            .expect("undoes");
+        assert_eq!(engine.accumulated_vote, before);
+        // `vote_interest = 0`: no interest and no liveness credit.
+        let mut flat = TestEngine::new_for_test(test_vote_scale(), 0);
+        check(&mut flat, reparsed(&a), reparsed(&b), &|_| false, 3, 0);
+    }
+
+    #[test]
+    fn a_liveness_credit_that_would_overflow_fails_closed() {
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        // Interest is capped at one `vote_scale`, so this grows to `u32::MAX − 10`
+        // and the 20-point credit overflows.
+        engine.set_accumulated_vote_for_test(4, u32::MAX - 1010);
+        let before = engine.accumulated_vote;
+        let crypto = test_crypto();
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let block = make_empty_block(1, &mut buf, &crypto);
+        assert_eq!(
+            engine.apply_block(block, |_| false, Some(4)),
+            Err(VoteEngineError::AccumulatedVoteOverflow)
+        );
+        assert_eq!(engine.accumulated_vote, before, "nothing applied");
     }
 }
