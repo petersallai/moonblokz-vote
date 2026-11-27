@@ -382,7 +382,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         liveness: Option<u32>,
     ) -> Result<(), VoteEngineError> {
         let params = self.params()?;
-        let target = Self::liveness_target(params, &block, liveness, &credit_excluded);
+        let target = Self::liveness_target(params, liveness, &credit_excluded);
         // Preflight: compute every node's post-apply value without mutating, so
         // arithmetic errors fail closed and leave the state unchanged.
         for node_id in 0..MAX_NODES {
@@ -465,24 +465,22 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
 
     /// The node the step-4 liveness credit goes to, if any (DEC-178): the
     /// caller's `liveness` candidate (the creator of block `s − H`) unless
-    /// `vote_interest = 0`, the candidate is a node `block` resets — its
-    /// creator, the equivocator a fact block names, or the originally-top node
-    /// a deviation block penalizes (DEC-342) — or it is credit-excluded (the
-    /// FR72 credit drop; the late-node hold, Story 7.7). Apply and undo derive
-    /// it identically.
+    /// `vote_interest = 0` or it is credit-excluded (the FR72 credit drop; the
+    /// late-node hold, Story 7.7). Apply and undo derive it identically.
+    ///
+    /// A node `block` resets — its creator, the equivocator a fact block
+    /// names, or the originally-top node a deviation block penalizes (DEC-342)
+    /// — gets no credit by construction: [`Self::apply_value_for`] returns its
+    /// reset 0 before the credit, and [`Self::undo_value_for`] restores it from
+    /// its snapshot.
     fn liveness_target(
         params: VoteParams,
-        block: &BlockView<'_>,
         liveness: Option<u32>,
         credit_excluded: &impl Fn(u32) -> bool,
     ) -> Option<usize> {
         let node = liveness?;
         let idx = node as usize;
-        (params.vote_interest > 0
-            && idx < MAX_NODES
-            && !Self::reset_by(block, idx)
-            && !credit_excluded(node))
-        .then_some(idx)
+        (params.vote_interest > 0 && idx < MAX_NODES && !credit_excluded(node)).then_some(idx)
     }
 
     /// Applies the exact inverse of [`apply_block`](Self::apply_block).
@@ -517,7 +515,7 @@ impl<const MAX_NODES: usize> VoteEngine<MAX_NODES> {
         liveness: Option<u32>,
     ) -> Result<(), VoteEngineError> {
         let params = self.params()?;
-        let target = Self::liveness_target(params, &block, liveness, &credit_excluded);
+        let target = Self::liveness_target(params, liveness, &credit_excluded);
         let creator_idx = block.creator() as usize;
         // Only a deviation block (`first_voted_node != creator`, FR45) penalized
         // a second node and recorded its snapshot.
