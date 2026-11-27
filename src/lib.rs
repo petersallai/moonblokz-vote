@@ -2919,7 +2919,8 @@ mod tests {
     }
 
     /// AC5 (DEC-344): only an evidence block opens a hold — not a deviation
-    /// block, whose first-voted node it resets, nor a normal block.
+    /// block, whose first-voted node it resets, nor a twin fact block, whose
+    /// equivocator it resets, nor a normal block.
     #[test]
     fn only_an_evidence_block_opens_a_hold() {
         let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
@@ -2936,6 +2937,13 @@ mod tests {
         engine
             .apply_block(normal, |_| false, None, None)
             .expect("applies");
+        engine.set_accumulated_vote_for_test(6, 500);
+        let mut buf = [0u8; moonblokz_chain_types::MAX_BLOCK_SIZE];
+        let fact = make_twin_fact_block(5, 0, 6, grown_of(500), &mut buf, &crypto);
+        engine
+            .apply_block(fact, |_| false, None, None)
+            .expect("applies");
+        assert_eq!(engine.accumulated_vote[6], 0, "the twin reset");
         assert!(engine.late_held.iter().all(|&h| h == 0));
     }
 
