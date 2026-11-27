@@ -3115,4 +3115,21 @@ mod tests {
         );
         assert_eq!((engine.accumulated_vote, engine.late_held), before);
     }
+
+    /// AR-021's accepted residual (DEC-337), pinned: the hold leaves the
+    /// creator order alone, so while every vote is 0 a held node with the
+    /// lowest id still heads it.
+    #[test]
+    fn a_held_node_still_heads_an_all_zero_order() {
+        let mut engine = TestEngine::new_for_test(test_vote_scale(), TEST_VOTE_INTEREST);
+        let crypto = test_crypto();
+        let mut buf = [0u8; MAX_BLOCK_SIZE_T];
+        let e = make_evidence_block(5, &[(0, 0)], &mut buf, &crypto);
+        engine
+            .apply_block(e, |_| false, None, None)
+            .expect("applies");
+        assert_eq!(engine.late_held[0], 1, "node 0 held");
+        assert!(engine.accumulated_vote.iter().all(|&v| v == 0));
+        assert_eq!(engine.top_creator(), Some(0), "held, yet on top");
+    }
 }
